@@ -83,6 +83,12 @@ class GenerateConfig:
     sub_sentence_present: bool = True
     precision: str = "bf16"
     dinov3_output_hidden_states: bool = True
+    dump_embeddings: bool = False
+    embedding_dump_dir: str = "embedding_dumps"
+    embedding_dump_max: int = 1
+    embedding_dump_every: int = 1
+    embedding_dump_print_summary: bool = True
+    embedding_dump_preview_values: int = 8
 
 
 def _parse_bool(value) -> bool:
@@ -331,6 +337,12 @@ def eval_libero(cfg: GenerateConfig) -> float:
         sub_sentence_present=cfg.sub_sentence_present,
         precision=cfg.precision,
         dinov3_output_hidden_states=cfg.dinov3_output_hidden_states,
+        dump_embeddings=cfg.dump_embeddings,
+        embedding_dump_dir=cfg.embedding_dump_dir,
+        embedding_dump_max=cfg.embedding_dump_max,
+        embedding_dump_every=cfg.embedding_dump_every,
+        embedding_dump_print_summary=cfg.embedding_dump_print_summary,
+        embedding_dump_preview_values=cfg.embedding_dump_preview_values,
     )
 
     if cfg.dry_run_model_load:

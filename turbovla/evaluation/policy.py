@@ -287,6 +287,12 @@ def _make_model_args(
     text_padding_length: int,
     precision: str,
     allow_hf_download: bool,
+    dump_embeddings: bool,
+    embedding_dump_dir: str,
+    embedding_dump_max: int,
+    embedding_dump_every: int,
+    embedding_dump_print_summary: bool,
+    embedding_dump_preview_values: int,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         dinov3_path=dinov3_path,
@@ -315,6 +321,12 @@ def _make_model_args(
         position_embedding="view",
         encode_views_separately=True,
         padding_strategy="key_padding_mask",
+        dump_embeddings=dump_embeddings,
+        embedding_dump_dir=embedding_dump_dir,
+        embedding_dump_max=embedding_dump_max,
+        embedding_dump_every=embedding_dump_every,
+        embedding_dump_print_summary=embedding_dump_print_summary,
+        embedding_dump_preview_values=embedding_dump_preview_values,
     )
 
 
@@ -350,6 +362,12 @@ class TurboVLAPolicy:
         precision: str = "bf16",
         dinov3_output_hidden_states: bool = True,
         verbose: bool = True,
+        dump_embeddings: bool = False,
+        embedding_dump_dir: str = "embedding_dumps",
+        embedding_dump_max: int = 1,
+        embedding_dump_every: int = 1,
+        embedding_dump_print_summary: bool = True,
+        embedding_dump_preview_values: int = 8,
     ) -> None:
         configure_transformers_offline(allow_hf_download=allow_hf_download)
 
@@ -395,6 +413,13 @@ class TurboVLAPolicy:
             config.vision.model_name_or_path = self.dinov3_path
             config.vision.local_files_only = not allow_hf_download
             config.vision.compute_precision = "bf16" if self.precision == "bf16" else "bf16_autocast"
+            config.embedding_dump.enabled = dump_embeddings
+            config.embedding_dump.output_dir = embedding_dump_dir
+            config.embedding_dump.max_dumps = embedding_dump_max
+            config.embedding_dump.every_n_forwards = embedding_dump_every
+            config.embedding_dump.print_summary = embedding_dump_print_summary
+            config.embedding_dump.preview_values = embedding_dump_preview_values
+            config.__post_init__()
             self.chunk_size = config.action.horizon
             self.action_dim = config.action.action_dim
             self.model = build_model(config)
@@ -419,6 +444,12 @@ class TurboVLAPolicy:
                 sub_sentence_present=sub_sentence_present,
                 precision=self.precision,
                 allow_hf_download=allow_hf_download,
+                dump_embeddings=dump_embeddings,
+                embedding_dump_dir=embedding_dump_dir,
+                embedding_dump_max=embedding_dump_max,
+                embedding_dump_every=embedding_dump_every,
+                embedding_dump_print_summary=embedding_dump_print_summary,
+                embedding_dump_preview_values=embedding_dump_preview_values,
             )
             self.model = build_model(model_args)
         self._load_checkpoint()
@@ -517,6 +548,10 @@ class TurboVLAPolicy:
             )
         return sanitize_pred_chunk(pred.detach().float().cpu().numpy()[0])
 
+    def set_parity_tracer(self, tracer) -> None:
+        if hasattr(self.model, "set_parity_tracer"):
+            self.model.set_parity_tracer(tracer)
+
     def predict_env_action_chunk(
         self,
         primary_image: np.ndarray,
@@ -533,6 +568,9 @@ class TurboVLAPolicy:
             ],
             axis=0,
         )
+        tracer = getattr(self.model, "_parity_tracer", None)
+        if tracer is not None and tracer.active:
+            tracer.tensor("action.denormalized", torch.from_numpy(env_actions), layout="T,A", operation="denormalize")
         if execute_steps is not None:
             env_actions = env_actions[: int(execute_steps)]
         return env_actions.astype(np.float32)

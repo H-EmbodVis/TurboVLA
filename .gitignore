@@ -15,6 +15,7 @@ playground/
 outputs/
 checkpoints/
 weights/
+pretrained/
 logs/
 wandb/
 eval_result/
@@ -46,3 +47,8 @@ tmp/
 # Browser QA artifacts.
 .playwright-cli/
 **/.playwright-cli/
+
+# Tensor parity traces
+outputs/embedding_dumps_legacy_*/
+outputs/parity_traces/
+outputs/*.tar.zst

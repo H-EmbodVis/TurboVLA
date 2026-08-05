@@ -237,6 +237,91 @@ bash scripts/robotwin/evaluate.sh \
 
 Append task names to the evaluation command to run a subset. Omitting them evaluates all 50 clean tasks.
 
+### Dumping embeddings
+
+Embedding dumping is disabled by default. Enable it in a structured model config with:
+
+```yaml
+embedding_dump:
+  enabled: true
+  output_dir: outputs/embedding_dumps
+  max_dumps: 1
+  every_n_forwards: 1
+  rank_zero_only: true
+  print_summary: true
+  preview_values: 8
+  capture_module_io: true
+  save_pt: true
+  save_raw: true
+```
+
+For a LIBERO evaluation, the shortest way to enable it is:
+
+```bash
+python experiments/libero/evaluate.py [existing arguments] \
+  --dump_embeddings \
+  --embedding_dump_dir outputs/embedding_dumps \
+  --embedding_dump_max 1
+```
+
+A deterministic one-sample trace can also be generated directly from a released LIBERO checkpoint. The script
+instantiates BERT and DINOv3 from their configs, strict-loads all weights from the TurboVLA checkpoint, and therefore
+only needs a local BERT tokenizer/config (not separate DINOv3 weights):
+
+```bash
+python scripts/dump_sample_trace.py \
+  --checkpoint pretrained/TurboVLA/checkpoints/libero/object.pth \
+  --bert_path pretrained/bert-base-uncased \
+  --primary_image /path/to/libero_agentview_256.png \
+  --wrist_image /path/to/libero_wristview_256.png \
+  --instruction "pick up the tomato sauce and place it in the basket" \
+  --state -0.14266449 -0.00231045 0.26431435 3.140582 -0.00140994 -0.09561598 0.03878892 -0.03878693 \
+  --normalize_state \
+  --dataset_source nvidia/LIBERO_LeRobot_v3:libero_object \
+  --episode_index 383 \
+  --primary_timestamp 372.30 \
+  --wrist_timestamp 0.00 \
+  --output_dir outputs/embedding_dumps/object_sample \
+  --device cuda
+```
+
+For legacy argument objects, use the equivalent fields `dump_embeddings`, `embedding_dump_dir`,
+`embedding_dump_max`, `embedding_dump_every`, `embedding_dump_rank_zero_only`,
+`embedding_dump_print_summary`, and `embedding_dump_preview_values`.
+
+Each selected forward writes a `forward_<index>_rank_<rank>/` trace directory. Pre/post hooks capture positional
+inputs, keyword inputs, and outputs of every PyTorch submodule in exact call-entry order. Manual checkpoints additionally
+cover functional boundaries such as masking, view/position addition, flattening, concatenation, and final actions.
+
+```text
+forward_000000_rank_0/
+|-- manifest.json       # C++-friendly call graph, tensor metadata, and file references
+|-- trace_index.pt      # the same index serialized by PyTorch
+`-- tensors/
+    |-- tensor_00000000.pt
+    |-- tensor_00000000.bin
+    `-- ...
+```
+
+The manifest also records the model config, complete module hierarchy, module `extra_repr`, and direct
+parameter/buffer shape and dtype metadata. Every traced tensor is snapshotted with its full value plus shape,
+stride, logical dtype, raw storage dtype, source device,
+requires-grad flag, byte length, and min/max/mean/std/finite-count statistics. `.bin` files are contiguous C-order
+raw bytes using the byte order declared in `manifest.json`; bfloat16 is stored as raw `uint16` bit patterns.
+
+Inspect execution order, shapes, statistics, or exact values with:
+
+```bash
+python scripts/inspect_embedding_trace.py outputs/embedding_dumps/forward_000000_rank_0
+python scripts/inspect_embedding_trace.py outputs/embedding_dumps/forward_000000_rank_0 \
+  --filter vision_projection --tensor output --max_values 64
+```
+
+For `vla.cpp`, iterate `module_calls` in `manifest.json`, reconstruct each `inputs`/`kwargs`/`output` tree from its
+tensor references, and load the referenced `.bin` files using `shape`, `storage_dtype`, and `byte_order`. This gives
+golden layer-by-layer values for parity tests without requiring LibTorch. Because exhaustive tracing stores every
+layer input and output in both PyTorch and raw formats, keep `max_dumps` small and budget substantial disk space.
+
 ---
 
 ## 👍 Acknowledgement

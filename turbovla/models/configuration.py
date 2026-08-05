@@ -63,12 +63,27 @@ class ActionHeadConfig:
 
 
 @dataclass
+class EmbeddingDumpConfig:
+    enabled: bool = False
+    output_dir: str = "embedding_dumps"
+    max_dumps: int = 1
+    every_n_forwards: int = 1
+    rank_zero_only: bool = True
+    print_summary: bool = True
+    preview_values: int = 8
+    capture_module_io: bool = True
+    save_pt: bool = True
+    save_raw: bool = True
+
+
+@dataclass
 class TurboVLAConfig:
     name: str = "TurboVLA"
     text: TextEncoderConfig = field(default_factory=TextEncoderConfig)
     vision: VisionEncoderConfig = field(default_factory=VisionEncoderConfig)
     interaction: InteractionConfig = field(default_factory=InteractionConfig)
     action: ActionHeadConfig = field(default_factory=ActionHeadConfig)
+    embedding_dump: EmbeddingDumpConfig = field(default_factory=EmbeddingDumpConfig)
 
     def __post_init__(self) -> None:
         if self.name != "TurboVLA":
@@ -101,6 +116,12 @@ class TurboVLAConfig:
             raise ValueError("interaction.compute_precision must be fp32 or bf16_autocast")
         if self.action.action_dim < 1 or self.action.state_dim < 1 or self.action.horizon < 1:
             raise ValueError("action dimensions and horizon must be positive")
+        if self.embedding_dump.max_dumps < 1:
+            raise ValueError("embedding_dump.max_dumps must be positive")
+        if self.embedding_dump.every_n_forwards < 1:
+            raise ValueError("embedding_dump.every_n_forwards must be positive")
+        if self.embedding_dump.preview_values < 0:
+            raise ValueError("embedding_dump.preview_values cannot be negative")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -114,4 +135,5 @@ class TurboVLAConfig:
             vision=VisionEncoderConfig(**dict(data.get("vision", {}))),
             interaction=InteractionConfig(**dict(data.get("interaction", {}))),
             action=ActionHeadConfig(**dict(data.get("action", {}))),
+            embedding_dump=EmbeddingDumpConfig(**dict(data.get("embedding_dump", {}))),
         )

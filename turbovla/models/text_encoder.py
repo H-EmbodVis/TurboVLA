@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 from torch import nn
@@ -98,6 +98,8 @@ class TurboVLATextEncoder(nn.Module):
         instructions: Sequence[str],
         device: torch.device,
         padding_length: int | None,
+        dump: Callable[[str, torch.Tensor], None] | None = None,
+        tracer: Any | None = None,
     ):
         tokenized, text_self_attention_masks, position_ids = self._tokenize_group(
             instructions,
@@ -111,9 +113,41 @@ class TurboVLATextEncoder(nn.Module):
         else:
             bert_inputs = tokenized
 
+        hook = None
+        embedding_hook = None
+        if dump is not None:
+            group_length = tokenized.input_ids.shape[1]
+            dump(f"text.group_{group_length}.input_ids", tokenized.input_ids)
+
+            def dump_bert_input(_module, _inputs, output):
+                dump(f"text.group_{group_length}.bert_input_embeddings", output)
+
+            hook = self.bert.embeddings.register_forward_hook(dump_bert_input)
+
+        if tracer is not None and tracer.active:
+            tracer.tensor("text.input_ids", tokenized.input_ids, layout="B,N", operation="tokenizer")
+            tracer.tensor("text.attention_mask", tokenized.attention_mask, layout="B,N", operation="tokenizer")
+            if text_self_attention_masks is not None:
+                tracer.tensor("text.text_self_attention_mask", text_self_attention_masks, layout="B,N,N", operation="tokenizer")
+            tracer.tensor("text.position_ids", position_ids, layout="B,N", operation="tokenizer")
+
+            def trace_embeddings(_module, _inputs, output):
+                tracer.tensor("text.bert.embeddings", output, layout="B,N,D", operation="embedding")
+
+            embedding_hook = self.bert.embeddings.register_forward_hook(trace_embeddings)
+
         grad_context = torch.no_grad() if self.config.frozen else nullcontext()
-        with grad_context:
-            bert_output = self.bert(**bert_inputs)
+        try:
+            with grad_context:
+                bert_output = self.bert(**bert_inputs)
+        finally:
+            if hook is not None:
+                hook.remove()
+            if embedding_hook is not None:
+                embedding_hook.remove()
+
+        if tracer is not None and tracer.active:
+            tracer.tensor("text.bert.last_hidden_state", bert_output.last_hidden_state, layout="B,N,D", operation="bert_output")
 
         return (
             bert_output.last_hidden_state,
@@ -121,14 +155,20 @@ class TurboVLATextEncoder(nn.Module):
             text_self_attention_masks,
         )
 
-    def encode_bert_hidden(self, instructions: Sequence[str], device: torch.device):
+    def encode_bert_hidden(
+        self,
+        instructions: Sequence[str],
+        device: torch.device,
+        dump: Callable[[str, torch.Tensor], None] | None = None,
+        tracer: Any | None = None,
+    ):
         if not instructions:
             raise ValueError("instructions cannot be empty")
         normalized = [str(item) for item in instructions]
         output_length = self.config.padding_length
         layout = self.config.padding_length_by_instruction
         if not layout:
-            return self._encode_group(normalized, device, output_length)
+            return self._encode_group(normalized, device, output_length, dump=dump, tracer=tracer)
 
         if output_length is None:
             raise ValueError("text.padding_length is required when instruction-specific lengths are configured")
@@ -149,6 +189,8 @@ class TurboVLATextEncoder(nn.Module):
                 group_instructions,
                 device,
                 group_length,
+                dump=dump,
+                tracer=tracer,
             )
             if hidden is None:
                 hidden = group_hidden.new_zeros((len(normalized), output_length, group_hidden.shape[-1]))
@@ -158,12 +200,30 @@ class TurboVLATextEncoder(nn.Module):
 
         return hidden, attention_mask, self_attention
 
-    def forward(self, instructions: Sequence[str], device: torch.device):
-        hidden, text_token_mask, text_self_attention_masks = self.encode_bert_hidden(instructions, device)
+    def forward(
+        self,
+        instructions: Sequence[str],
+        device: torch.device,
+        dump: Callable[[str, torch.Tensor], None] | None = None,
+        tracer: Any | None = None,
+    ):
+        hidden, text_token_mask, text_self_attention_masks = self.encode_bert_hidden(
+            instructions,
+            device,
+            dump=dump,
+            tracer=tracer,
+        )
+        if dump is not None:
+            dump("text.bert_hidden", hidden)
+            dump("text.token_mask", text_token_mask)
 
         hidden = hidden.to(dtype=self.text_projection.weight.dtype)
         text_tokens = self.text_projection(hidden)
         text_key_padding_mask = ~text_token_mask
         if self.config.zero_padded_tokens:
             text_tokens = text_tokens.masked_fill(text_key_padding_mask.unsqueeze(-1), 0.0)
+        if dump is not None:
+            dump("text.projected_tokens", text_tokens)
+        if tracer is not None and tracer.active:
+            tracer.tensor("text.projection.output", text_tokens, layout="B,N,D", operation="linear_projection")
         return text_tokens, text_key_padding_mask, text_self_attention_masks

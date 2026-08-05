@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from typing import Callable
 
 import torch
 from torch import nn
@@ -117,17 +118,25 @@ class DINOv3VisionEncoder(nn.Module):
             f"or {expected_patches + self.prefix_tokens} tokens including prefixes"
         )
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        dump: Callable[[str, torch.Tensor], None] | None = None,
+    ) -> torch.Tensor:
         if pixel_values.ndim != 5:
             raise ValueError(f"pixel_values must be [B,V,3,H,W], got {tuple(pixel_values.shape)}")
         batch_size, num_views = pixel_values.shape[:2]
         if num_views != self.config.num_views:
             raise ValueError(f"expected {self.config.num_views} views, got {num_views}")
         if self.config.encode_views_separately:
-            return torch.stack(
+            tokens = torch.stack(
                 [self._encode_images(pixel_values[:, view_idx]) for view_idx in range(num_views)],
                 dim=1,
             )
-        flat = pixel_values.flatten(0, 1)
-        tokens = self._encode_images(flat)
-        return tokens.view(batch_size, num_views, tokens.shape[1], tokens.shape[2])
+        else:
+            flat = pixel_values.flatten(0, 1)
+            tokens = self._encode_images(flat)
+            tokens = tokens.view(batch_size, num_views, tokens.shape[1], tokens.shape[2])
+        if dump is not None:
+            dump("vision.dinov3_patch_tokens", tokens)
+        return tokens

@@ -100,6 +100,17 @@ def parse_args():
     parser.add_argument("--text_dropout", type=float, default=0.0)
     parser.add_argument("--fusion_dropout", type=float, default=0.0)
     parser.add_argument("--fusion_droppath", type=float, default=0.1)
+    parser.add_argument("--dump_embeddings", action="store_true")
+    parser.add_argument("--embedding_dump_dir", type=str, default="embedding_dumps")
+    parser.add_argument("--embedding_dump_max", type=int, default=1)
+    parser.add_argument("--embedding_dump_every", type=int, default=1)
+    parser.add_argument("--embedding_dump_preview_values", type=int, default=8)
+    parser.set_defaults(embedding_dump_print_summary=True)
+    parser.add_argument(
+        "--no_embedding_dump_print_summary",
+        dest="embedding_dump_print_summary",
+        action="store_false",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     parser.set_defaults(allow_hf_download=False)
@@ -223,6 +234,12 @@ def build_model_architecture(args):
     model_args.position_embedding = "view"
     model_args.encode_views_separately = True
     model_args.padding_strategy = "key_padding_mask"
+    model_args.dump_embeddings = args.dump_embeddings
+    model_args.embedding_dump_dir = args.embedding_dump_dir
+    model_args.embedding_dump_max = args.embedding_dump_max
+    model_args.embedding_dump_every = args.embedding_dump_every
+    model_args.embedding_dump_print_summary = args.embedding_dump_print_summary
+    model_args.embedding_dump_preview_values = args.embedding_dump_preview_values
     return build_turbovla(model_args)
 
 

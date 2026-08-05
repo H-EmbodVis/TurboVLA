@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from torch import nn
@@ -12,13 +12,16 @@ from .components.transformer import TransformerEncoderLayer
 from .components.utils import _get_clones
 from .configuration import (
     ActionHeadConfig,
+    EmbeddingDumpConfig,
     InteractionConfig,
     TextEncoderConfig,
     TurboVLAConfig,
     VisionEncoderConfig,
 )
+from .embedding_dump import EmbeddingDumper
 from .text_encoder import TurboVLATextEncoder
 from .vision_encoder import DINOv3VisionEncoder
+from ..debug import TraceConfig, TraceContext
 
 
 class VisionProjection(nn.Module):
@@ -67,18 +70,26 @@ class VisionLanguageInteraction(nn.Module):
         text_tokens: torch.Tensor,
         text_key_padding_mask: torch.Tensor,
         text_self_attention_masks: torch.Tensor | None,
+        dump: Callable[[str, torch.Tensor], None] | None = None,
+        tracer: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         zero_fill = self.padding_strategy == "zero_fill"
         if zero_fill:
             text_tokens = text_tokens.masked_fill(text_key_padding_mask.unsqueeze(-1), 0.0)
 
-        for fusion_layer, text_layer in zip(self.fusion_layers, self.text_layers):
+        for layer_index, (fusion_layer, text_layer) in enumerate(zip(self.fusion_layers, self.text_layers)):
+            if tracer is not None and tracer.active:
+                tracer.tensor(f"interaction.layer_{layer_index:02d}.visual.input", visual_tokens, layout="B,VxN,D", operation="layer_input")
+                tracer.tensor(f"interaction.layer_{layer_index:02d}.text.input", text_tokens, layout="B,N,D", operation="layer_input")
             visual_tokens, text_tokens = fusion_layer(
                 v=visual_tokens,
                 l=text_tokens,
                 attention_mask_v=None,
                 attention_mask_l=text_key_padding_mask,
             )
+            if dump is not None:
+                dump(f"interaction.layer_{layer_index}.visual_after_fusion", visual_tokens)
+                dump(f"interaction.layer_{layer_index}.text_after_fusion", text_tokens)
             source_mask = None if text_self_attention_masks is None else ~text_self_attention_masks
             text_tokens = text_layer(
                 src=text_tokens.transpose(0, 1),
@@ -88,6 +99,11 @@ class VisionLanguageInteraction(nn.Module):
             ).transpose(0, 1)
             if zero_fill:
                 text_tokens = text_tokens.masked_fill(text_key_padding_mask.unsqueeze(-1), 0.0)
+            if dump is not None:
+                dump(f"interaction.layer_{layer_index}.text_after_enhancer", text_tokens)
+            if tracer is not None and tracer.active:
+                tracer.tensor(f"interaction.layer_{layer_index:02d}.visual.output", visual_tokens, layout="B,VxN,D", operation="layer_output")
+                tracer.tensor(f"interaction.layer_{layer_index:02d}.text.output", text_tokens, layout="B,N,D", operation="layer_output")
         return visual_tokens, text_tokens
 
 
@@ -102,6 +118,9 @@ class TurboVLA(nn.Module):
         self.chunk_size = int(config.action.horizon)
         self.state_dim = int(config.action.state_dim)
         self.num_views = int(config.vision.num_views)
+        self.embedding_dumper = EmbeddingDumper(config.embedding_dump)
+        # Parity trace context – disabled by default.
+        self._parity_tracer: TraceContext | None = None
 
         self.text_encoder = TurboVLATextEncoder(config.text, hidden_dim=hidden_dim)
         self.vision_encoder = DINOv3VisionEncoder(config.vision)
@@ -163,10 +182,28 @@ class TurboVLA(nn.Module):
         return tokens + view
 
     def encode_vision(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        tokens = self.vision_encoder(pixel_values)
+        dump = self.embedding_dumper.record if self.embedding_dumper.active else None
+        tracer = self._parity_tracer
+        tokens = self.vision_encoder(pixel_values, dump=dump)
+        if tracer is not None and tracer.active:
+            tracer.tensor("vision.dinov3_patch_tokens", tokens, layout="B,V,N,D", operation="dino_encoder")
         tokens = tokens.to(dtype=self.vision_projection.skip.weight.dtype)
         tokens = self.vision_projection(tokens)
-        return self._position_visual_tokens(tokens).flatten(1, 2)
+        if dump is not None:
+            dump("vision.projected_tokens", tokens)
+        if tracer is not None and tracer.active:
+            tracer.tensor("vision_projection.output", tokens, layout="B,V,N,D", operation="vision_projection")
+        tokens = self._position_visual_tokens(tokens)
+        if dump is not None:
+            dump("vision.positioned_tokens", tokens)
+        if tracer is not None and tracer.active:
+            tracer.tensor("vision_projection.position_add", tokens, layout="B,V,N,D", operation="position_add")
+        tokens = tokens.flatten(1, 2)
+        if dump is not None:
+            dump("vision.flattened_tokens", tokens)
+        if tracer is not None and tracer.active:
+            tracer.tensor("vision_projection.flattened", tokens, layout="B,VxN,D", operation="flatten")
+        return tokens
 
     def encode_condition(
         self,
@@ -179,20 +216,46 @@ class TurboVLA(nn.Module):
         if self.config.interaction.compute_precision == "bf16_autocast" and device.type == "cuda":
             precision_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         with precision_context:
+            dump = self.embedding_dumper.record if self.embedding_dumper.active else None
+            tracer = self._parity_tracer
+            if dump is not None:
+                dump("vision.pixel_values", pixel_values)
+            if tracer is not None and tracer.active:
+                tracer.tensor("input.pixel_values", pixel_values, layout="B,V,C,H,W", operation="input")
             text_tokens, text_key_padding_mask, text_self_attention_masks = self.text_encoder(
                 instructions,
                 device=device,
+                dump=dump,
+                tracer=tracer,
             )
+            if tracer is not None and tracer.active:
+                tracer.tensor("text.key_padding_mask", text_key_padding_mask, layout="B,N", operation="mask")
+                if text_self_attention_masks is not None:
+                    tracer.tensor("text.self_attention_mask", text_self_attention_masks, layout="B,N,N", operation="mask")
             if text_tokens.shape[0] != pixel_values.shape[0]:
                 raise ValueError("instruction batch size does not match image batch size")
             visual_tokens = self.encode_vision(pixel_values)
+            if tracer is not None and tracer.active:
+                tracer.tensor("vision.output", visual_tokens, layout="B,VxN,D", operation="vision_encoder")
             visual_tokens, text_tokens = self.vision_language_interaction(
                 visual_tokens=visual_tokens,
                 text_tokens=text_tokens,
                 text_key_padding_mask=text_key_padding_mask,
                 text_self_attention_masks=text_self_attention_masks,
+                dump=dump,
+                tracer=tracer,
             )
-            return torch.cat([visual_tokens, text_tokens], dim=1)
+            if tracer is not None and tracer.active:
+                tracer.tensor("interaction.visual_output", visual_tokens, layout="B,VxN,D", operation="interaction")
+                tracer.tensor("interaction.text_output", text_tokens, layout="B,N,D", operation="interaction")
+            condition = torch.cat([visual_tokens, text_tokens], dim=1)
+            if dump is not None:
+                dump("condition.vision_language_tokens", condition)
+            if tracer is not None and tracer.active:
+                tracer.tensor("condition.visual_tokens", visual_tokens, layout="B,VxN,D", operation="split")
+                tracer.tensor("condition.text_tokens", text_tokens, layout="B,N,D", operation="split")
+                tracer.tensor("condition.concatenated", condition, layout="B,VxN+N,D", operation="concat")
+            return condition
 
     def forward(
         self,
@@ -200,9 +263,47 @@ class TurboVLA(nn.Module):
         samples: torch.Tensor | Mapping[str, torch.Tensor],
         state: torch.Tensor,
     ) -> torch.Tensor:
-        condition = self.encode_condition(instructions, samples)
-        action_dtype = self.action_head.decoder.action_queries.weight.dtype
-        return self.action_head(condition.to(dtype=action_dtype), state.to(dtype=action_dtype))
+        self.embedding_dumper.begin(self)
+        tracer = self._parity_tracer
+        if tracer is not None:
+            tracer.begin(forward_index=self.embedding_dumper.forward_index - 1,
+                         fixture_id=getattr(tracer, '_requested_fixture_id', ''))
+        try:
+            condition = self.encode_condition(instructions, samples)
+            action_dtype = self.action_head.decoder.action_queries.weight.dtype
+            dump = self.embedding_dumper.record if self.embedding_dumper.active else None
+            if tracer is not None and tracer.active:
+                tracer.tensor("state_projection.input_raw", state, layout="B,D", operation="input")
+            actions = self.action_head(
+                condition.to(dtype=action_dtype),
+                state.to(dtype=action_dtype),
+                dump=dump,
+                tracer=tracer,
+            )
+            if tracer is not None and tracer.active:
+                tracer.tensor("action.normalized", actions, layout="B,T,A", operation="tanh_output")
+        except Exception as error:
+            self.embedding_dumper.finish(error=f"{type(error).__name__}: {error}")
+            if tracer is not None:
+                tracer.finish()
+            raise
+        self.embedding_dumper.finish()
+        if tracer is not None:
+            trace_dir = tracer.finish()
+            # Write model_config.json alongside trace
+            if trace_dir is not None:
+                import json as _json
+                try:
+                    cfg_dict = self.config.to_dict() if hasattr(self.config, 'to_dict') else vars(self.config)
+                    (trace_dir / 'model_config.json').write_text(
+                        _json.dumps(cfg_dict, indent=2, default=str), encoding='utf-8')
+                except Exception:
+                    pass
+        return actions
+
+    def set_parity_tracer(self, tracer: TraceContext | None) -> None:
+        """Attach a parity trace context. Pass None to disable."""
+        self._parity_tracer = tracer
 
     # Transitional read-only names used only by legacy checkpoint initialization.
     @property
@@ -288,6 +389,15 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 mlp_hidden_dim=int(_arg(args, "act_mlp_hidden_dim", 512)),
                 state_hidden_dim=int(_arg(args, "act_state_hidden_dim", 256)),
                 dropout=float(_arg(args, "act_dropout", 0.1)),
+            ),
+            embedding_dump=EmbeddingDumpConfig(
+                enabled=bool(_arg(args, "dump_embeddings", False)),
+                output_dir=str(_arg(args, "embedding_dump_dir", "embedding_dumps")),
+                max_dumps=int(_arg(args, "embedding_dump_max", 1)),
+                every_n_forwards=int(_arg(args, "embedding_dump_every", 1)),
+                rank_zero_only=bool(_arg(args, "embedding_dump_rank_zero_only", True)),
+                print_summary=bool(_arg(args, "embedding_dump_print_summary", True)),
+                preview_values=int(_arg(args, "embedding_dump_preview_values", 8)),
             ),
         )
     return TurboVLA(config)
