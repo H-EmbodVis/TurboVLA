@@ -1,0 +1,14 @@
+action.normalized_0
+condition.concatenated_0
+input.pixel_values_0
+interaction.text_output_0
+interaction.visual_output_0
+state_projection.input_raw_0
+text.bert.last_hidden_state_0
+text.key_padding_mask_0
+text.self_attention_mask_0
+vision.dinov3_patch_tokens_0
+vision.output_0
+vision_projection.flattened_0
+vision_projection.output_0
+vision_projection.position_add_0

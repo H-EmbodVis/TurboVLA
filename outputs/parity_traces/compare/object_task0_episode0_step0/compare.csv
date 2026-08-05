@@ -1,0 +1,15 @@
+semantic_name,status
+action.normalized_0,MISSING_CANDIDATE
+condition.concatenated_0,MISSING_CANDIDATE
+input.pixel_values_0,MISSING_CANDIDATE
+interaction.text_output_0,MISSING_CANDIDATE
+interaction.visual_output_0,MISSING_CANDIDATE
+state_projection.input_raw_0,MISSING_CANDIDATE
+text.bert.last_hidden_state_0,MISSING_CANDIDATE
+text.key_padding_mask_0,MISSING_CANDIDATE
+text.self_attention_mask_0,MISSING_CANDIDATE
+vision.dinov3_patch_tokens_0,MISSING_CANDIDATE
+vision.output_0,MISSING_CANDIDATE
+vision_projection.flattened_0,MISSING_CANDIDATE
+vision_projection.output_0,MISSING_CANDIDATE
+vision_projection.position_add_0,MISSING_CANDIDATE

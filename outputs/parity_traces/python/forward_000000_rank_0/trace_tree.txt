@@ -1,0 +1,30 @@
+
+00_input
+  0000 input.pixel_values  [1x2x3x256x256] float32
+
+10_text_encoder
+  0001 text.bert.last_hidden_state  [1x21x256] float32
+  0002 text.key_padding_mask  [1x21] bool
+  0003 text.self_attention_mask  [1x21x21] bool
+
+20_vision_encoder
+  0004 vision.dinov3_patch_tokens  [1x2x256x768] float32
+  0008 vision.output  [1x512x256] float32
+
+30_vision_projection
+  0005 vision_projection.output  [1x2x256x256] float32
+  0006 vision_projection.position_add  [1x2x256x256] float32
+  0007 vision_projection.flattened  [1x512x256] float32
+
+40_interaction
+  0009 interaction.visual_output  [1x512x256] float32
+  0010 interaction.text_output  [1x21x256] float32
+
+45_condition
+  0011 condition.concatenated  [1x533x256] float32
+
+50_state_projection
+  0012 state_projection.input_raw  [1x8] float32
+
+60_action_decoder
+  0013 action.normalized  [1x12x7] float32

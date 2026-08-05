@@ -1,0 +1,72 @@
+
+00_input
+  0000 input.pixel_values  [1x2x3x256x256] float32
+
+10_text_encoder
+  0001 text.input_ids  [1x14] int64
+  0002 text.attention_mask  [1x14] int64
+  0003 text.text_self_attention_mask  [1x14x14] bool
+  0004 text.position_ids  [1x14] int64
+  0005 text.bert.embeddings  [1x14x768] float32
+  0006 text.bert.last_hidden_state  [1x14x768] float32
+  0007 text.projection.output  [1x21x256] float32
+  0008 text.key_padding_mask  [1x21] bool
+  0009 text.self_attention_mask  [1x21x21] bool
+
+20_vision_encoder
+  0010 vision.dinov3_patch_tokens  [1x2x256x768] float32
+  0014 vision.output  [1x512x256] float32
+
+30_vision_projection
+  0011 vision_projection.output  [1x2x256x256] float32
+  0012 vision_projection.position_add  [1x2x256x256] float32
+  0013 vision_projection.flattened  [1x512x256] float32
+
+40_interaction
+  0015 interaction.layer_00.visual.input  [1x512x256] float32
+  0016 interaction.layer_00.text.input  [1x21x256] float32
+  0017 interaction.layer_00.visual.output  [1x512x256] float32
+  0018 interaction.layer_00.text.output  [1x21x256] float32
+  0019 interaction.layer_01.visual.input  [1x512x256] float32
+  0020 interaction.layer_01.text.input  [1x21x256] float32
+  0021 interaction.layer_01.visual.output  [1x512x256] float32
+  0022 interaction.layer_01.text.output  [1x21x256] float32
+  0023 interaction.layer_02.visual.input  [1x512x256] float32
+  0024 interaction.layer_02.text.input  [1x21x256] float32
+  0025 interaction.layer_02.visual.output  [1x512x256] float32
+  0026 interaction.layer_02.text.output  [1x21x256] float32
+  0027 interaction.layer_03.visual.input  [1x512x256] float32
+  0028 interaction.layer_03.text.input  [1x21x256] float32
+  0029 interaction.layer_03.visual.output  [1x512x256] float32
+  0030 interaction.layer_03.text.output  [1x21x256] float32
+  0031 interaction.layer_04.visual.input  [1x512x256] float32
+  0032 interaction.layer_04.text.input  [1x21x256] float32
+  0033 interaction.layer_04.visual.output  [1x512x256] float32
+  0034 interaction.layer_04.text.output  [1x21x256] float32
+  0035 interaction.layer_05.visual.input  [1x512x256] float32
+  0036 interaction.layer_05.text.input  [1x21x256] float32
+  0037 interaction.layer_05.visual.output  [1x512x256] float32
+  0038 interaction.layer_05.text.output  [1x21x256] float32
+  0039 interaction.visual_output  [1x512x256] float32
+  0040 interaction.text_output  [1x21x256] float32
+
+45_condition
+  0041 condition.visual_tokens  [1x512x256] float32
+  0042 condition.text_tokens  [1x21x256] float32
+  0043 condition.concatenated  [1x533x256] float32
+
+50_state_projection
+  0044 state_projection.input_raw  [1x8] float32
+  0045 state_projection.input_normalized  [1x8] float32
+  0046 state_projection.reshape  [1x2x256] float32
+  0047 state_projection.position_embedding  [1x2x256] float32
+  0048 state_projection.output  [1x2x256] float32
+
+60_action_decoder
+  0049 action.memory.condition  [1x533x256] float32
+  0050 action.memory.state_tokens  [1x2x256] float32
+  0051 action.memory.concatenated  [1x535x256] float32
+  0052 action.queries  [1x12x256] float32
+  0053 action.decoder_hidden  [1x12x256] float32
+  0054 action.before_tanh  [1x12x7] float32
+  0055 action.normalized  [1x12x7] float32

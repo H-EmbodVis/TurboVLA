@@ -1,0 +1,58 @@
+[
+  {
+    "semantic_name": "action.normalized_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "condition.concatenated_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "input.pixel_values_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "interaction.text_output_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "interaction.visual_output_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "state_projection.input_raw_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "text.bert.last_hidden_state_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "text.key_padding_mask_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "text.self_attention_mask_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "vision.dinov3_patch_tokens_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "vision.output_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "vision_projection.flattened_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "vision_projection.output_0",
+    "status": "MISSING_CANDIDATE"
+  },
+  {
+    "semantic_name": "vision_projection.position_add_0",
+    "status": "MISSING_CANDIDATE"
+  }
+]

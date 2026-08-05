@@ -1,0 +1,11 @@
+{
+  "python_version": "3.10.20 (main, Jun 11 2026, 15:17:37) [GCC 14.3.0]",
+  "torch_version": "2.3.1+cu121",
+  "numpy_version": "1.26.4",
+  "cuda_available": true,
+  "cuda_version": "12.1",
+  "platform": "Linux-7.0.0-28-generic-x86_64-with-glibc2.43",
+  "byte_order": "little",
+  "gpu_name": "NVIDIA GeForce RTX 3050 6GB Laptop GPU",
+  "gpu_count": 1
+}
