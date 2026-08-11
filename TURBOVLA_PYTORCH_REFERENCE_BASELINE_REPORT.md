@@ -1,4 +1,4 @@
-# TurboVLA PyTorch reference baseline implementation report
+# TurboVLA Exhaustive PyTorch Reference Baseline Report
 
 ## Result
 

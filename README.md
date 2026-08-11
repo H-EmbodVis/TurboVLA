@@ -38,6 +38,9 @@ The command returns success only when every `baseline_status.json` gate passes. 
 artifacts are ignored by Git. `scripts/legacy_dump_sample_trace.py` and `EmbeddingDumper` are
 legacy inspection tools and are not parity-authoritative.
 
+See the [implementation and validation report](TURBOVLA_PYTORCH_REFERENCE_BASELINE_REPORT.md)
+for the completed baseline results, coverage metrics, test results, and archive checksum.
+
 <div align="center">
   <img src="assets/figures/real-world-tasks.gif" alt="TurboVLA real-world tasks with synchronous inference" width="100%">
   <br>
