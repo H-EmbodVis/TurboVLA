@@ -50,5 +50,8 @@ tmp/
 
 # Tensor parity traces
 outputs/embedding_dumps_legacy_*/
+outputs/embedding_dumps/
 outputs/parity_traces/
+outputs/parity_baseline/
+outputs/pytorch_reference_baselines/
 outputs/*.tar.zst

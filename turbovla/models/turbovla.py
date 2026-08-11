@@ -22,6 +22,7 @@ from .embedding_dump import EmbeddingDumper
 from .text_encoder import TurboVLATextEncoder
 from .vision_encoder import DINOv3VisionEncoder
 from ..debug import TraceConfig, TraceContext
+from ..debug.model_trace import emit, tensor_axis, trace_layer_norm, trace_linear
 
 
 class VisionProjection(nn.Module):
@@ -37,8 +38,24 @@ class VisionProjection(nn.Module):
         self.skip = nn.Linear(in_dim, out_dim, bias=False)
         self.output_norm = nn.LayerNorm(out_dim)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.output_norm(self.skip(tokens) + self.mlp(self.input_norm(tokens)))
+    def forward(self, tokens: torch.Tensor, tracer: Any | None = None) -> torch.Tensor:
+        emit(tracer, "vision_projection.input", tokens, "B,V,N,Din", "input", "boundary")
+        normalized = trace_layer_norm(tracer, "vision_projection.input_norm", tokens, self.input_norm, layout="B,V,N,Din")
+        skip = torch.matmul(tokens, self.skip.weight.transpose(-1, -2))
+        emit(tracer, "vision_projection.skip.matmul", skip, "B,V,N,D", "matmul", "exhaustive")
+        emit(tracer, "vision_projection.skip.output", self.skip(tokens), "B,V,N,D", "linear", "op")
+        mlp_1 = trace_linear(tracer, "vision_projection.mlp.linear_1", normalized, self.mlp[0], layout="B,V,N,F")
+        gelu = self.mlp[1](mlp_1)
+        emit(tracer, "vision_projection.mlp.gelu.input", mlp_1, "B,V,N,F", "gelu", "exhaustive")
+        emit(tracer, "vision_projection.mlp.gelu.output", gelu, "B,V,N,F", "gelu", "op")
+        mlp_2 = trace_linear(tracer, "vision_projection.mlp.linear_2", gelu, self.mlp[3], layout="B,V,N,D")
+        actual_skip, actual_mlp = self.skip(tokens), self.mlp(self.input_norm(tokens))
+        emit(tracer, "vision_projection.residual.left", actual_skip, "B,V,N,D", "identity", "exhaustive")
+        emit(tracer, "vision_projection.residual.right", actual_mlp, "B,V,N,D", "identity", "exhaustive")
+        summed = actual_skip + actual_mlp
+        emit(tracer, "vision_projection.residual.sum", summed, "B,V,N,D", "add", "op")
+        trace_layer_norm(tracer, "vision_projection.output_norm", summed, self.output_norm, layout="B,V,N,D")
+        return self.output_norm(summed)
 
 
 class VisionLanguageInteraction(nn.Module):
@@ -86,6 +103,8 @@ class VisionLanguageInteraction(nn.Module):
                 l=text_tokens,
                 attention_mask_v=None,
                 attention_mask_l=text_key_padding_mask,
+                tracer=tracer,
+                prefix=f"interaction.layer_{layer_index:02d}",
             )
             if dump is not None:
                 dump(f"interaction.layer_{layer_index}.visual_after_fusion", visual_tokens)
@@ -96,14 +115,13 @@ class VisionLanguageInteraction(nn.Module):
                 src_mask=source_mask,
                 src_key_padding_mask=None if zero_fill else text_key_padding_mask,
                 pos=None,
+                tracer=tracer,
+                prefix=f"interaction.layer_{layer_index:02d}.text_enhancer",
             ).transpose(0, 1)
             if zero_fill:
                 text_tokens = text_tokens.masked_fill(text_key_padding_mask.unsqueeze(-1), 0.0)
             if dump is not None:
                 dump(f"interaction.layer_{layer_index}.text_after_enhancer", text_tokens)
-            if tracer is not None and tracer.active:
-                tracer.tensor(f"interaction.layer_{layer_index:02d}.visual.output", visual_tokens, layout="B,VxN,D", operation="layer_output")
-                tracer.tensor(f"interaction.layer_{layer_index:02d}.text.output", text_tokens, layout="B,N,D", operation="layer_output")
         return visual_tokens, text_tokens
 
 
@@ -184,20 +202,20 @@ class TurboVLA(nn.Module):
     def encode_vision(self, pixel_values: torch.Tensor) -> torch.Tensor:
         dump = self.embedding_dumper.record if self.embedding_dumper.active else None
         tracer = self._parity_tracer
-        tokens = self.vision_encoder(pixel_values, dump=dump)
-        if tracer is not None and tracer.active:
-            tracer.tensor("vision.dinov3_patch_tokens", tokens, layout="B,V,N,D", operation="dino_encoder")
+        tokens = self.vision_encoder(pixel_values, dump=dump, tracer=tracer)
         tokens = tokens.to(dtype=self.vision_projection.skip.weight.dtype)
-        tokens = self.vision_projection(tokens)
+        tokens = self.vision_projection(tokens, tracer=tracer)
         if dump is not None:
             dump("vision.projected_tokens", tokens)
         if tracer is not None and tracer.active:
-            tracer.tensor("vision_projection.output", tokens, layout="B,V,N,D", operation="vision_projection")
+            tracer.tensor("vision_projection.view_embedding", self.view_embedding, layout="1,V,D", operation="parameter", required_level="op")
+            tracer.tensor("vision_projection.position.before_add", tokens, layout="B,V,N,D", operation="identity", required_level="exhaustive")
         tokens = self._position_visual_tokens(tokens)
         if dump is not None:
             dump("vision.positioned_tokens", tokens)
         if tracer is not None and tracer.active:
-            tracer.tensor("vision_projection.position_add", tokens, layout="B,V,N,D", operation="position_add")
+            tracer.tensor("vision_projection.position.after_add", tokens, layout="B,V,N,D", operation="position_add", required_level="op")
+            tracer.tensor("vision_projection.before_flatten", tokens, layout="B,V,N,D", operation="identity", required_level="exhaustive")
         tokens = tokens.flatten(1, 2)
         if dump is not None:
             dump("vision.flattened_tokens", tokens)
@@ -220,23 +238,15 @@ class TurboVLA(nn.Module):
             tracer = self._parity_tracer
             if dump is not None:
                 dump("vision.pixel_values", pixel_values)
-            if tracer is not None and tracer.active:
-                tracer.tensor("input.pixel_values", pixel_values, layout="B,V,C,H,W", operation="input")
             text_tokens, text_key_padding_mask, text_self_attention_masks = self.text_encoder(
                 instructions,
                 device=device,
                 dump=dump,
                 tracer=tracer,
             )
-            if tracer is not None and tracer.active:
-                tracer.tensor("text.key_padding_mask", text_key_padding_mask, layout="B,N", operation="mask")
-                if text_self_attention_masks is not None:
-                    tracer.tensor("text.self_attention_mask", text_self_attention_masks, layout="B,N,N", operation="mask")
             if text_tokens.shape[0] != pixel_values.shape[0]:
                 raise ValueError("instruction batch size does not match image batch size")
             visual_tokens = self.encode_vision(pixel_values)
-            if tracer is not None and tracer.active:
-                tracer.tensor("vision.output", visual_tokens, layout="B,VxN,D", operation="vision_encoder")
             visual_tokens, text_tokens = self.vision_language_interaction(
                 visual_tokens=visual_tokens,
                 text_tokens=text_tokens,
@@ -245,15 +255,13 @@ class TurboVLA(nn.Module):
                 dump=dump,
                 tracer=tracer,
             )
-            if tracer is not None and tracer.active:
-                tracer.tensor("interaction.visual_output", visual_tokens, layout="B,VxN,D", operation="interaction")
-                tracer.tensor("interaction.text_output", text_tokens, layout="B,N,D", operation="interaction")
             condition = torch.cat([visual_tokens, text_tokens], dim=1)
             if dump is not None:
                 dump("condition.vision_language_tokens", condition)
             if tracer is not None and tracer.active:
                 tracer.tensor("condition.visual_tokens", visual_tokens, layout="B,VxN,D", operation="split")
                 tracer.tensor("condition.text_tokens", text_tokens, layout="B,N,D", operation="split")
+                tracer.tensor("condition.concat_axis", tensor_axis(1, condition.device), layout="", operation="constant", required_level="exhaustive")
                 tracer.tensor("condition.concatenated", condition, layout="B,VxN+N,D", operation="concat")
             return condition
 
@@ -263,11 +271,9 @@ class TurboVLA(nn.Module):
         samples: torch.Tensor | Mapping[str, torch.Tensor],
         state: torch.Tensor,
     ) -> torch.Tensor:
-        self.embedding_dumper.begin(self)
         tracer = self._parity_tracer
-        if tracer is not None:
-            tracer.begin(forward_index=self.embedding_dumper.forward_index - 1,
-                         fixture_id=getattr(tracer, '_requested_fixture_id', ''))
+        # EmbeddingDumper is retained only for explicit legacy inspection.
+        self.embedding_dumper.begin(self)
         try:
             condition = self.encode_condition(instructions, samples)
             action_dtype = self.action_head.decoder.action_queries.weight.dtype
@@ -280,25 +286,10 @@ class TurboVLA(nn.Module):
                 dump=dump,
                 tracer=tracer,
             )
-            if tracer is not None and tracer.active:
-                tracer.tensor("action.normalized", actions, layout="B,T,A", operation="tanh_output")
         except Exception as error:
             self.embedding_dumper.finish(error=f"{type(error).__name__}: {error}")
-            if tracer is not None:
-                tracer.finish()
             raise
         self.embedding_dumper.finish()
-        if tracer is not None:
-            trace_dir = tracer.finish()
-            # Write model_config.json alongside trace
-            if trace_dir is not None:
-                import json as _json
-                try:
-                    cfg_dict = self.config.to_dict() if hasattr(self.config, 'to_dict') else vars(self.config)
-                    (trace_dir / 'model_config.json').write_text(
-                        _json.dumps(cfg_dict, indent=2, default=str), encoding='utf-8')
-                except Exception:
-                    pass
         return actions
 
     def set_parity_tracer(self, tracer: TraceContext | None) -> None:

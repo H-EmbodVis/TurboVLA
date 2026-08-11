@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import warnings
 from typing import Any, Mapping
 
 import torch
@@ -60,6 +61,11 @@ class EmbeddingDumper:
         self.forward_index += 1
         if not selected:
             return False
+        warnings.warn(
+            "EmbeddingDumper is legacy-only; use TraceContext + TensorWriter for parity output",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._trace_dir = self._new_trace_dir(current_forward)
         self._tensor_index = 0
         self._module_call_counts.clear()

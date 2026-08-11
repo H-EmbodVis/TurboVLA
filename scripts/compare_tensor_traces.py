@@ -3,266 +3,186 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 from pathlib import Path
+
 import numpy as np
 
-def load_manifest(trace_dir: Path) -> dict:
-    manifest_path = trace_dir / "manifest.jsonl"
-    if not manifest_path.exists():
-        return {}
-    
-    tensors = {}
-    with open(manifest_path, "r") as f:
-        for line in f:
-            if line.strip():
-                t = json.loads(line)
-                name = t.get("semantic_name")
-                call_index = t.get("call_index", 0)
-                if name:
-                    tensors[f"{name}_{call_index}"] = t
-    return tensors
 
-def get_dtype(dtype_str: str) -> np.dtype:
-    mapping = {
-        "float32": np.float32, "f32": np.float32,
-        "float16": np.float16, "f16": np.float16,
-        "bfloat16": np.uint16, "torch.bfloat16": np.uint16,
-        "uint16": np.uint16,
-        "int32": np.int32, "i32": np.int32,
-        "int64": np.int64, "i64": np.int64,
-        "bool": np.bool_
-    }
-    return mapping.get(dtype_str.lower(), np.float32)
+DTYPES = {
+    "float32": "<f4", "f32": "<f4", "float16": "<f2", "f16": "<f2",
+    "int64": "<i8", "i64": "<i8", "int32": "<i4", "i32": "<i4",
+    "int16": "<i2", "int8": "i1", "uint8": "u1", "bool": "u1",
+}
 
-def main():
-    parser = argparse.ArgumentParser(description="Compare tensor traces")
-    parser.add_argument("--reference", type=Path, required=True, help="Reference trace dir")
-    parser.add_argument("--candidate", type=Path, required=True, help="Candidate trace dir")
-    parser.add_argument("--output", type=Path, required=True, help="Output dir")
-    parser.add_argument("--atol", type=float, default=0.02, help="Absolute tolerance")
-    parser.add_argument("--rtol", type=float, default=0.02, help="Relative tolerance")
-    parser.add_argument("--stop-after-first-failure", type=lambda x: (str(x).lower() in ['true', '1', 'yes']), default=False)
-    args = parser.parse_args()
 
-    ref_tensors = load_manifest(args.reference)
-    cand_tensors = load_manifest(args.candidate)
+def load_manifest(trace_dir: Path) -> list[dict]:
+    path = trace_dir / "manifest.jsonl"
+    if not path.is_file():
+        raise FileNotFoundError(f"manifest not found: {path}")
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    previous = -1
+    for record in records:
+        trace_id = int(record["trace_id"])
+        if trace_id <= previous:
+            raise ValueError(f"non-monotonic reference trace_id: {trace_id} after {previous}")
+        previous = trace_id
+    return records
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    diff_dir = args.output / "diff_tensors"
-    diff_dir.mkdir(parents=True, exist_ok=True)
 
-    results = []
-    
-    missing_in_cand = set(ref_tensors.keys()) - set(cand_tensors.keys())
-    missing_in_ref = set(cand_tensors.keys()) - set(ref_tensors.keys())
-    
-    with open(args.output / "missing_in_python.txt", "w") as f:
-        for m in sorted(missing_in_ref):
-            f.write(f"{m}\n")
-            results.append({"semantic_name": m, "status": "MISSING_REFERENCE"})
-            
-    with open(args.output / "missing_in_cpp.txt", "w") as f:
-        for m in sorted(missing_in_cand):
-            f.write(f"{m}\n")
-            results.append({"semantic_name": m, "status": "MISSING_CANDIDATE"})
+def semantic_key(record: dict) -> tuple[str, int]:
+    return record["semantic_name"], int(record.get("call_index", 0))
 
-    shape_mismatches = []
-    layout_mismatches = []
-    first_failure = None
-    first_failure_prev = None
-    prev_passing_name = None
 
-    common_keys = sorted(set(ref_tensors.keys()) & set(cand_tensors.keys()))
-    
-    for key in common_keys:
-        ref_t = ref_tensors[key]
-        cand_t = cand_tensors[key]
-        
-        name = ref_t.get("semantic_name")
-        
-        ref_shape = ref_t.get("shape", [])
-        cand_shape = cand_t.get("shape", [])
-        ref_layout = ref_t.get("layout", "")
-        cand_layout = cand_t.get("layout", "")
-        
-        shape_match = (ref_shape == cand_shape)
-        layout_match = (ref_layout == cand_layout)
-        numel_match = (np.prod(ref_shape) == np.prod(cand_shape))
-        
-        if not shape_match:
-            shape_mismatches.append(name)
-        if not layout_match:
-            layout_mismatches.append(name)
-            
-        res = {
-            "semantic_name": name,
-            "shape_match": shape_match,
-            "layout_match": layout_match,
-            "numel_match": numel_match,
-            "ref_nan_count": ref_t.get("nan_count", 0),
-            "ref_inf_count": ref_t.get("inf_count", 0),
-            "cand_nan_count": cand_t.get("nan_count", 0),
-            "cand_inf_count": cand_t.get("inf_count", 0),
+def _read(trace_dir: Path, record: dict) -> np.ndarray:
+    storage = record.get("storage_dtype", "float32").lower().removeprefix("torch.")
+    if storage == "bfloat16":
+        # Legacy manifests may point at BF16 bits instead of canonical F32.
+        bits = np.fromfile(trace_dir / record["file"], dtype="<u2")
+        return (bits.astype(np.uint32) << 16).view(np.float32)
+    if storage not in DTYPES:
+        raise TypeError(f"unsupported storage dtype {storage!r}")
+    return np.fromfile(trace_dir / record["file"], dtype=DTYPES[storage])
+
+
+def _safe_metrics(reference: np.ndarray, candidate: np.ndarray, exact: bool) -> dict:
+    if exact:
+        return {
+            "exact_match": True, "max_abs_error": 0.0, "mean_abs_error": 0.0,
+            "median_abs_error": 0.0, "rmse": 0.0, "max_relative_error": 0.0,
+            "mean_relative_error": 0.0, "cosine_similarity": 1.0, "pearson_correlation": 1.0,
         }
+    ref, cand = reference.astype(np.float64), candidate.astype(np.float64)
+    difference = np.abs(ref - cand)
+    denominator = np.maximum(np.abs(ref), np.finfo(np.float64).tiny)
+    relative = difference / denominator
+    ref_centered, cand_centered = ref - ref.mean(), cand - cand.mean()
+    cosine_denominator = np.linalg.norm(ref) * np.linalg.norm(cand)
+    pearson_denominator = np.linalg.norm(ref_centered) * np.linalg.norm(cand_centered)
+    def finite(value: float) -> float | None:
+        return float(value) if np.isfinite(value) else None
 
-        if not numel_match:
-            res["status"] = "FAIL_SHAPE"
-            results.append(res)
-            continue
-            
-        ref_file = args.reference / ref_t.get("file", "")
-        cand_file = args.candidate / cand_t.get("file", "")
-        
-        if not ref_file.exists() or not cand_file.exists():
-            res["status"] = "MISSING_FILE"
-            results.append(res)
-            continue
-            
-        ref_data = np.fromfile(ref_file, dtype=get_dtype(ref_t.get("storage_dtype", "f32"))).astype(np.float32)
-        cand_data = np.fromfile(cand_file, dtype=get_dtype(cand_t.get("storage_dtype", "f32"))).astype(np.float32)
-        
-        if ref_data.size != cand_data.size:
-            res["status"] = "FAIL_SHAPE"
-            results.append(res)
-            continue
-            
-        exact_match = bool(np.array_equal(ref_data, cand_data))
-        res["exact_match"] = exact_match
-        
-        abs_diff = np.abs(ref_data - cand_data)
-        max_abs_error = float(np.max(abs_diff))
-        mean_abs_error = float(np.mean(abs_diff))
-        median_abs_error = float(np.median(abs_diff))
-        rmse = float(np.sqrt(np.mean(abs_diff**2)))
-        
-        epsilon = 1e-8
-        rel_diff = abs_diff / (np.abs(ref_data) + epsilon)
-        max_relative_error = float(np.max(rel_diff))
-        mean_relative_error = float(np.mean(rel_diff))
-        
-        try:
-            if np.std(ref_data) > 0 and np.std(cand_data) > 0:
-                pearson_correlation = float(np.corrcoef(ref_data.flatten(), cand_data.flatten())[0, 1])
-                cosine_similarity = float(np.dot(ref_data.flatten(), cand_data.flatten()) / (np.linalg.norm(ref_data) * np.linalg.norm(cand_data)))
-            else:
-                pearson_correlation = 1.0 if exact_match else 0.0
-                cosine_similarity = 1.0 if exact_match else 0.0
-        except:
-            pearson_correlation = 0.0
-            cosine_similarity = 0.0
-            
-        res.update({
-            "max_abs_error": max_abs_error,
-            "mean_abs_error": mean_abs_error,
-            "median_abs_error": median_abs_error,
-            "rmse": rmse,
-            "max_relative_error": max_relative_error,
-            "mean_relative_error": mean_relative_error,
-            "cosine_similarity": cosine_similarity,
-            "pearson_correlation": pearson_correlation,
-        })
-        
-        is_nan = np.isnan(cand_data).any() or np.isinf(cand_data).any()
-        
-        status = "PASS_EXACT"
-        if not exact_match:
-            if max_abs_error <= args.atol and max_relative_error <= args.rtol:
-                status = "PASS_TOLERANCE"
-            else:
-                status = "FAIL_TOLERANCE"
-                
-        if is_nan:
-            status = "FAIL_NAN"
-            
-        if not shape_match:
-            status = "FAIL_SHAPE"
-        elif not layout_match and status not in ["FAIL_NAN", "FAIL_TOLERANCE"]:
-            status = "FAIL_LAYOUT"
-            
-        res["status"] = status
-        
-        if status in ["FAIL_TOLERANCE", "FAIL_NAN"]:
-            diff_indices = np.where(~np.isclose(ref_data, cand_data, rtol=args.rtol, atol=args.atol))[0]
-            if len(diff_indices) > 0:
-                first_bad_flat_index = int(diff_indices[0])
-                res["first_bad_flat_index"] = first_bad_flat_index
-                if len(ref_shape) > 0:
-                    res["first_bad_coordinate"] = str(np.unravel_index(first_bad_flat_index, ref_shape))
-                else:
-                    res["first_bad_coordinate"] = "()"
-                res["reference_value"] = float(ref_data[first_bad_flat_index])
-                res["candidate_value"] = float(cand_data[first_bad_flat_index])
-                
-            safe_name = name.replace("/", "_")
-            (cand_data - ref_data).astype(np.float32).tofile(diff_dir / f"{safe_name}.diff.f32le.bin")
-            abs_diff.astype(np.float32).tofile(diff_dir / f"{safe_name}.abs_diff.f32le.bin")
-            rel_diff.astype(np.float32).tofile(diff_dir / f"{safe_name}.relative_diff.f32le.bin")
-            
-            if first_failure is None:
-                first_failure = res
-                first_failure_prev = prev_passing_name
-                if args.stop_after_first_failure:
-                    results.append(res)
-                    break
+    return {
+        "exact_match": exact,
+        "max_abs_error": finite(difference.max(initial=0.0)),
+        "mean_abs_error": finite(difference.mean()) if difference.size else 0.0,
+        "median_abs_error": finite(np.median(difference)) if difference.size else 0.0,
+        "rmse": finite(np.sqrt(np.mean(difference ** 2))) if difference.size else 0.0,
+        "max_relative_error": finite(relative.max(initial=0.0)),
+        "mean_relative_error": finite(relative.mean()) if relative.size else 0.0,
+        "cosine_similarity": finite(np.dot(ref, cand) / cosine_denominator) if cosine_denominator else (1.0 if exact else 0.0),
+        "pearson_correlation": finite(np.dot(ref_centered, cand_centered) / pearson_denominator) if pearson_denominator else (1.0 if exact else 0.0),
+    }
+
+
+def compare_traces(reference_dir: Path, candidate_dir: Path, output_dir: Path, *, atol: float = 0.0,
+                   rtol: float = 0.0, stop_after_first_failure: bool = False) -> dict:
+    reference_records, candidate_records = load_manifest(reference_dir), load_manifest(candidate_dir)
+    candidate_by_key = {semantic_key(record): record for record in candidate_records}
+    reference_keys = {semantic_key(record) for record in reference_records}
+    results: list[dict] = []
+    first_failure = None
+    previous_passing = None
+    output_dir.mkdir(parents=True, exist_ok=True)
+    diff_dir = output_dir / "diff_tensors"
+
+    for reference in reference_records:  # Reference execution order is authoritative.
+        key = semantic_key(reference)
+        name, call_index = key
+        candidate = candidate_by_key.get(key)
+        result = {"semantic_name": name, "call_index": call_index, "reference_trace_id": reference["trace_id"]}
+        if candidate is None:
+            result["status"] = "MISSING_CANDIDATE"
         else:
-            prev_passing_name = name
-            
-        results.append(res)
+            result["candidate_trace_id"] = candidate["trace_id"]
+            result["shape_match"] = reference.get("shape") == candidate.get("shape")
+            result["layout_match"] = reference.get("layout", "") == candidate.get("layout", "")
+            result.update(
+                ref_nan_count=reference.get("nan_count", 0), ref_inf_count=reference.get("inf_count", 0),
+                cand_nan_count=candidate.get("nan_count", 0), cand_inf_count=candidate.get("inf_count", 0),
+            )
+            if not result["shape_match"]:
+                result["status"] = "FAIL_SHAPE"
+            elif not result["layout_match"]:
+                result["status"] = "FAIL_LAYOUT"
+            else:
+                ref_data, cand_data = _read(reference_dir, reference), _read(candidate_dir, candidate)
+                if ref_data.size != cand_data.size:
+                    result["status"] = "FAIL_SHAPE"
+                else:
+                    exact = bool(np.array_equal(ref_data, cand_data))
+                    result.update(_safe_metrics(ref_data, cand_data, exact))
+                    finite = bool(np.isfinite(ref_data).all() and np.isfinite(cand_data).all())
+                    close = bool(np.allclose(cand_data, ref_data, rtol=rtol, atol=atol, equal_nan=False))
+                    result["status"] = "PASS_EXACT" if exact else ("PASS_TOLERANCE" if finite and close else ("FAIL_NAN" if not finite else "FAIL_TOLERANCE"))
+                    if not exact and not close:
+                        bad = np.flatnonzero(~np.isclose(cand_data, ref_data, rtol=rtol, atol=atol, equal_nan=False))
+                        if bad.size:
+                            flat_index = int(bad[0])
+                            result.update(
+                                first_bad_flat_index=flat_index,
+                                first_bad_coordinate=[int(item) for item in np.unravel_index(flat_index, reference.get("shape", []))] if reference.get("shape") else [],
+                                reference_value=float(ref_data[flat_index]) if np.isfinite(ref_data[flat_index]) else None,
+                                candidate_value=float(cand_data[flat_index]) if np.isfinite(cand_data[flat_index]) else None,
+                            )
+                        diff_dir.mkdir(exist_ok=True)
+                        safe = name.replace("/", "_") + f"__call_{call_index:02d}"
+                        (cand_data.astype(np.float64) - ref_data.astype(np.float64)).astype("<f4").tofile(diff_dir / f"{safe}.diff.f32le.bin")
+        results.append(result)
+        if result["status"].startswith("PASS"):
+            previous_passing = f"{name}::call_{call_index:02d}"
+        elif first_failure is None:
+            first_failure = dict(result)
+            first_failure["previous_passing_tensor"] = previous_passing
+            if stop_after_first_failure:
+                break
 
-    with open(args.output / "shape_mismatches.txt", "w") as f:
-        for s in shape_mismatches:
-            f.write(f"{s}\n")
-            
-    with open(args.output / "layout_mismatches.txt", "w") as f:
-        for s in layout_mismatches:
-            f.write(f"{s}\n")
-            
-    def json_serializer(obj):
-        if isinstance(obj, (np.bool_, bool)):
-            return bool(obj)
-        if isinstance(obj, (np.integer, int)):
-            return int(obj)
-        if isinstance(obj, (np.floating, float)):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return str(obj)
+    if not stop_after_first_failure:
+        for candidate in candidate_records:
+            key = semantic_key(candidate)
+            if key not in reference_keys:
+                results.append({"semantic_name": key[0], "call_index": key[1],
+                                "candidate_trace_id": candidate["trace_id"], "status": "MISSING_REFERENCE"})
+                if first_failure is None:
+                    first_failure = dict(results[-1])
+                    first_failure["previous_passing_tensor"] = previous_passing
 
-    if first_failure:
-        with open(args.output / "first_divergence.txt", "w") as f:
-            f.write("First Failing Tensor:\n")
-            f.write(json.dumps(first_failure, indent=2, default=json_serializer))
-            f.write(f"\nPrevious Passing Tensor: {first_failure_prev}\n")
+    statuses: dict[str, int] = {}
+    for result in results:
+        statuses[result["status"]] = statuses.get(result["status"], 0) + 1
+    fieldnames = sorted({key for result in results for key in result})
+    with (output_dir / "compare.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+    (output_dir / "compare.json").write_text(json.dumps(results, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    (output_dir / "first_divergence.txt").write_text(
+        "PASS_EXACT\n" if first_failure is None else json.dumps(first_failure, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "shape_mismatches.txt").write_text("\n".join(r["semantic_name"] for r in results if r["status"] == "FAIL_SHAPE"), encoding="utf-8")
+    (output_dir / "layout_mismatches.txt").write_text("\n".join(r["semantic_name"] for r in results if r["status"] == "FAIL_LAYOUT"), encoding="utf-8")
+    (output_dir / "missing_in_cpp.txt").write_text("\n".join(r["semantic_name"] for r in results if r["status"] == "MISSING_CANDIDATE"), encoding="utf-8")
+    (output_dir / "missing_in_python.txt").write_text("\n".join(r["semantic_name"] for r in results if r["status"] == "MISSING_REFERENCE"), encoding="utf-8")
+    summary = {"status": "PASS" if first_failure is None else "FAIL", "status_counts": statuses,
+               "tensor_count": len(results), "first_divergence": first_failure}
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    return summary
 
-    valid_results = [r for r in results if "max_abs_error" in r]
-    worst = sorted(valid_results, key=lambda x: x.get("max_abs_error", 0), reverse=True)[:10]
-    with open(args.output / "worst_tensors.txt", "w") as f:
-        for w in worst:
-            f.write(f"{w['semantic_name']}: {w['max_abs_error']}\n")
 
-    with open(args.output / "compare.json", "w") as f:
-        json.dump(results, f, indent=2, default=json_serializer)
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Compare semantic tensor traces in reference execution order")
+    parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--atol", type=float, default=0.0)
+    parser.add_argument("--rtol", type=float, default=0.0)
+    parser.add_argument("--stop-after-first-failure", action="store_true")
+    args = parser.parse_args()
+    summary = compare_traces(args.reference, args.candidate, args.output, atol=args.atol, rtol=args.rtol,
+                             stop_after_first_failure=args.stop_after_first_failure)
+    print(json.dumps(summary, indent=2))
+    return 0 if summary["status"] == "PASS" else 1
 
-    if len(results) > 0:
-        keys = set()
-        for r in results:
-            keys.update(r.keys())
-        
-        with open(args.output / "compare.csv", "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=sorted(list(keys)))
-            writer.writeheader()
-            for r in results:
-                writer.writerow(r)
 
-    print("=== Comparison Summary ===")
-    status_counts = {}
-    for r in results:
-        s = r.get("status")
-        status_counts[s] = status_counts.get(s, 0) + 1
-        
-    for s, c in status_counts.items():
-        print(f"{s}: {c}")
-
-if __name__ == '__main__':
-    exit(main())
+if __name__ == "__main__":
+    raise SystemExit(main())
