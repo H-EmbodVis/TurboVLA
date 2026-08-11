@@ -16,6 +16,28 @@
 
 This repository contains the official implementation of **TurboVLA** for the paper **TurboVLA: Real-Time Vision-Language-Action Model at 32 Hz on an RTX 4090 with &lt;1 GB VRAM**.
 
+## Exhaustive PyTorch reference baseline
+
+Build a frozen real-LIBERO reference (fixture, exact inputs, three exhaustive traces,
+weights/buffers, self-comparison, coverage report, status, and archive) with:
+
+```bash
+python scripts/build_pytorch_reference_baseline.py \
+  --task-suite libero_object --task-id 0 --episode 0 --step 0 --seed 7 \
+  --checkpoint pretrained/TurboVLA/checkpoints/libero/object.pth \
+  --dinov3-path pretrained/dinov3/dinov3-vitb16 \
+  --bert-path pretrained/bert-base-uncased \
+  --stats-path pretrained/TurboVLA/libero_all4_stats.json \
+  --stats-key libero_all4_no_noops --libero-root "$HOME/Desktop/LIBERO" \
+  --device cuda --precision bf16 --trace-level exhaustive \
+  --output-root outputs/pytorch_reference_baselines \
+  --baseline-id libero_object_task0_ep0_step0_bf16 --overwrite
+```
+
+The command returns success only when every `baseline_status.json` gate passes. Generated
+artifacts are ignored by Git. `scripts/legacy_dump_sample_trace.py` and `EmbeddingDumper` are
+legacy inspection tools and are not parity-authoritative.
+
 <div align="center">
   <img src="assets/figures/real-world-tasks.gif" alt="TurboVLA real-world tasks with synchronous inference" width="100%">
   <br>

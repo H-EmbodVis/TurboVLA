@@ -1,28 +1,30 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
+
 
 @dataclass
 class TensorRecord:
     trace_id: int
     semantic_name: str
+    call_index: int
     module_path: str | None = None
     operation: str = "unknown"
-    call_index: int = 0
     io: str = "intermediate"
     stage: str = ""
+    required_level: str = "boundary"
     shape: list[int] = field(default_factory=list)
     layout: str = ""
     strides: list[int] = field(default_factory=list)
     source_dtype: str = ""
-    storage_dtype: str = "float32"
+    storage_dtype: str = ""
+    native_storage_dtype: str = ""
     endianness: str = "little"
     contiguous: bool = True
     numel: int = 0
     file: str = ""
-    pt_file: str | None = None
-    raw_bf16_file: str | None = None
+    native_file: str | None = None
     min: float = 0.0
     max: float = 0.0
     mean: float = 0.0
@@ -34,34 +36,22 @@ class TensorRecord:
     zero_ratio: float = 0.0
     nan_count: int = 0
     inf_count: int = 0
-    first_values: list[float] = field(default_factory=list)
-    last_values: list[float] = field(default_factory=list)
-    sha256_f32: str = ""
+    first_values: list[float | int | bool | None] = field(default_factory=list)
+    last_values: list[float | int | bool | None] = field(default_factory=list)
+    sha256_f32: str | None = None
+    sha256_native: str = ""
     timestamp_ns: int = 0
 
+    # Backwards-compatible aliases for old trace readers.
+    @property
+    def raw_bf16_file(self) -> str | None:
+        return self.native_file if self.native_storage_dtype == "bfloat16" else None
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        payload["raw_bf16_file"] = self.raw_bf16_file
+        payload["pt_file"] = None
+        return payload
 
     def to_jsonl_line(self) -> str:
-        return json.dumps(self.to_dict()) + "\n"
-
-    def to_csv_row(self) -> str:
-        shape_str = "x".join(map(str, self.shape)) if self.shape else "scalar"
-        fields = [
-            str(self.trace_id),
-            self.semantic_name,
-            shape_str,
-            self.layout,
-            self.source_dtype,
-            self.storage_dtype,
-            f"{self.min:.6g}",
-            f"{self.max:.6g}",
-            f"{self.mean:.6g}",
-            f"{self.std:.6g}",
-            f"{self.abs_max:.6g}",
-            f"{self.l2_norm:.6g}",
-            str(self.nan_count),
-            str(self.inf_count),
-            self.file
-        ]
-        return ",".join(fields) + "\n"
+        return json.dumps(self.to_dict(), ensure_ascii=False, allow_nan=False) + "\n"

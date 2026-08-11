@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import DropPath
 
+from ...debug.model_trace import emit, trace_layer_norm, trace_linear, trace_softmax
+
 
 class FeatureResizer(nn.Module):
     """
@@ -182,7 +184,7 @@ class BiMultiHeadAttention(nn.Module):
         output_l = output_l.transpose(1, 2).reshape(batch_size, source_len, self.embed_dim)
         return self.out_v_proj(output_v), self.out_l_proj(output_l)
 
-    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None):
+    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None, tracer=None, prefix="interaction.layer_00"):
         """_summary_
 
         Args:
@@ -201,10 +203,23 @@ class BiMultiHeadAttention(nn.Module):
         #     import ipdb; ipdb.set_trace()
         bsz, tgt_len, _ = v.size()
 
-        query_states = self.v_proj(v) * self.scale
-        key_states = self._shape(self.l_proj(l), -1, bsz)
-        value_v_states = self._shape(self.values_v_proj(v), -1, bsz)
-        value_l_states = self._shape(self.values_l_proj(l), -1, bsz)
+        q_unscaled = self.v_proj(v)
+        k_linear = self.l_proj(l)
+        vv_linear = self.values_v_proj(v)
+        vl_linear = self.values_l_proj(l)
+        trace_linear(tracer, f"{prefix}.cross.q_visual", v, self.v_proj)
+        trace_linear(tracer, f"{prefix}.cross.k_text", l, self.l_proj)
+        trace_linear(tracer, f"{prefix}.cross.v_visual", v, self.values_v_proj)
+        trace_linear(tracer, f"{prefix}.cross.v_text", l, self.values_l_proj)
+        query_states = q_unscaled * self.scale
+        key_states = self._shape(k_linear, -1, bsz)
+        value_v_states = self._shape(vv_linear, -1, bsz)
+        value_l_states = self._shape(vl_linear, -1, bsz)
+        for name, linear, heads in (("q_visual", q_unscaled, self._shape(q_unscaled, tgt_len, bsz)),
+                                    ("k_text", k_linear, key_states), ("v_visual", vv_linear, value_v_states),
+                                    ("v_text", vl_linear, value_l_states)):
+            emit(tracer, f"{prefix}.cross.{name}.reshape", linear.view(bsz, -1, self.num_heads, self.head_dim), "B,N,H,Dh", "reshape", "exhaustive")
+            emit(tracer, f"{prefix}.cross.{name}.transpose", heads, "B,H,N,Dh", "transpose", "exhaustive")
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
@@ -214,6 +229,8 @@ class BiMultiHeadAttention(nn.Module):
 
         src_len = key_states.size(1)
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))  # bs*nhead, nimg, ntxt
+        emit(tracer, f"{prefix}.cross.visual_to_text.qk_matmul", attn_weights, "BH,V,L", "bmm", "op")
+        emit(tracer, f"{prefix}.cross.visual_to_text.logits_raw", attn_weights, "BH,V,L", "identity", "exhaustive")
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -221,7 +238,10 @@ class BiMultiHeadAttention(nn.Module):
             )
 
         if self.stable_softmax_2d:
-            attn_weights = attn_weights - attn_weights.max()
+            global_max = attn_weights.max()
+            emit(tracer, f"{prefix}.cross.visual_to_text.global_max", global_max, "", "max", "exhaustive")
+            attn_weights = attn_weights - global_max
+            emit(tracer, f"{prefix}.cross.visual_to_text.logits_global_shifted", attn_weights, "BH,V,L", "subtract", "exhaustive")
 
         if self.clamp_min_for_underflow:
             attn_weights = torch.clamp(
@@ -231,9 +251,14 @@ class BiMultiHeadAttention(nn.Module):
             attn_weights = torch.clamp(
                 attn_weights, max=50000
             )  # Do not increase 50000, data type half has quite limited range
+        emit(tracer, f"{prefix}.cross.visual_to_text.logits_clamped", attn_weights, "BH,V,L", "clamp", "exhaustive")
 
         attn_weights_T = attn_weights.transpose(1, 2)
-        attn_weights_l = attn_weights_T - torch.max(attn_weights_T, dim=-1, keepdim=True)[0]
+        emit(tracer, f"{prefix}.cross.text_to_visual.logits_transposed", attn_weights_T, "BH,L,V", "transpose", "exhaustive")
+        row_max = torch.max(attn_weights_T, dim=-1, keepdim=True)[0]
+        emit(tracer, f"{prefix}.cross.text_to_visual.row_max", row_max, "BH,L,1", "max", "exhaustive")
+        attn_weights_l = attn_weights_T - row_max
+        emit(tracer, f"{prefix}.cross.text_to_visual.logits_shifted", attn_weights_l, "BH,L,V", "subtract", "exhaustive")
         if self.clamp_min_for_underflow:
             attn_weights_l = torch.clamp(
                 attn_weights_l, min=-50000
@@ -242,6 +267,7 @@ class BiMultiHeadAttention(nn.Module):
             attn_weights_l = torch.clamp(
                 attn_weights_l, max=50000
             )  # Do not increase 50000, data type half has quite limited range
+        emit(tracer, f"{prefix}.cross.text_to_visual.logits_clamped", attn_weights_l, "BH,L,V", "clamp", "exhaustive")
 
         # mask vison for language
         if attention_mask_v is not None:
@@ -250,6 +276,11 @@ class BiMultiHeadAttention(nn.Module):
             )
             attn_weights_l.masked_fill_(attention_mask_v, float("-inf"))
 
+        mask_v = attention_mask_v if attention_mask_v is not None else torch.zeros_like(attn_weights_l, dtype=torch.bool)
+        emit(tracer, f"{prefix}.cross.text_to_visual.mask", mask_v, "BH,L,V", "mask", "exhaustive")
+        emit(tracer, f"{prefix}.cross.text_to_visual.masked_logits", attn_weights_l, "BH,L,V", "masked_fill", "op")
+
+        trace_softmax(tracer, f"{prefix}.cross.text_to_visual.softmax", attn_weights_l, layout="BH,L,V", output_dtype=attn_weights_l.dtype)
         attn_weights_l = attn_weights_l.softmax(dim=-1)
 
         # mask language for vision
@@ -258,13 +289,19 @@ class BiMultiHeadAttention(nn.Module):
                 attention_mask_l[:, None, None, :].repeat(1, self.num_heads, 1, 1).flatten(0, 1)
             )
             attn_weights.masked_fill_(attention_mask_l, float("-inf"))
+        mask_l = attention_mask_l if attention_mask_l is not None else torch.zeros_like(attn_weights, dtype=torch.bool)
+        emit(tracer, f"{prefix}.cross.visual_to_text.mask", mask_l, "BH,V,L", "mask", "exhaustive")
+        emit(tracer, f"{prefix}.cross.visual_to_text.masked_logits", attn_weights, "BH,V,L", "masked_fill", "op")
         attn_weights_v = attn_weights.softmax(dim=-1)
+        trace_softmax(tracer, f"{prefix}.cross.visual_to_text.softmax", attn_weights, layout="BH,V,L", output_dtype=attn_weights_v.dtype)
 
         attn_probs_v = F.dropout(attn_weights_v, p=self.dropout, training=self.training)
         attn_probs_l = F.dropout(attn_weights_l, p=self.dropout, training=self.training)
 
         attn_output_v = torch.bmm(attn_probs_v, value_l_states)
         attn_output_l = torch.bmm(attn_probs_l, value_v_states)
+        emit(tracer, f"{prefix}.cross.visual_to_text.context_heads", attn_output_v, "BH,V,Dh", "bmm", "op")
+        emit(tracer, f"{prefix}.cross.text_to_visual.context_heads", attn_output_l, "BH,L,Dh", "bmm", "op")
 
         if attn_output_v.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -278,14 +315,22 @@ class BiMultiHeadAttention(nn.Module):
 
         attn_output_v = attn_output_v.view(bsz, self.num_heads, tgt_len, self.head_dim)
         attn_output_v = attn_output_v.transpose(1, 2)
+        emit(tracer, f"{prefix}.cross.visual_to_text.context_transpose", attn_output_v, "B,V,H,Dh", "transpose", "exhaustive")
         attn_output_v = attn_output_v.reshape(bsz, tgt_len, self.embed_dim)
+        emit(tracer, f"{prefix}.cross.visual_to_text.context_merged", attn_output_v, "B,V,D", "reshape", "op")
 
         attn_output_l = attn_output_l.view(bsz, self.num_heads, src_len, self.head_dim)
         attn_output_l = attn_output_l.transpose(1, 2)
+        emit(tracer, f"{prefix}.cross.text_to_visual.context_transpose", attn_output_l, "B,L,H,Dh", "transpose", "exhaustive")
         attn_output_l = attn_output_l.reshape(bsz, src_len, self.embed_dim)
+        emit(tracer, f"{prefix}.cross.text_to_visual.context_merged", attn_output_l, "B,L,D", "reshape", "op")
 
+        trace_linear(tracer, f"{prefix}.cross.visual_to_text.output", attn_output_v, self.out_v_proj)
+        trace_linear(tracer, f"{prefix}.cross.text_to_visual.output", attn_output_l, self.out_l_proj)
         attn_output_v = self.out_v_proj(attn_output_v)
         attn_output_l = self.out_l_proj(attn_output_l)
+        emit(tracer, f"{prefix}.cross.visual_to_text.output", attn_output_v, "B,V,D", "linear", "layer")
+        emit(tracer, f"{prefix}.cross.text_to_visual.output", attn_output_l, "B,L,D", "linear", "layer")
 
         return attn_output_v, attn_output_l
 
@@ -333,17 +378,34 @@ class BiAttentionBlock(nn.Module):
         self.gamma_l = nn.Parameter(init_values * torch.ones((l_dim)), requires_grad=True)
         self.residual_style = residual_style
 
-    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None):
+    def forward(self, v, l, attention_mask_v=None, attention_mask_l=None, tracer=None, prefix="interaction.layer_00"):
         residual_v, residual_l = v, l
+        emit(tracer, f"{prefix}.visual.residual_source", residual_v, "B,V,D", "identity", "op")
+        emit(tracer, f"{prefix}.text.residual_source", residual_l, "B,L,D", "identity", "op")
+        trace_layer_norm(tracer, f"{prefix}.visual.norm", v, self.layer_norm_v)
+        trace_layer_norm(tracer, f"{prefix}.text.norm", l, self.layer_norm_l)
         v = self.layer_norm_v(v)
         l = self.layer_norm_l(l)
         delta_v, delta_l = self.attn(
-            v, l, attention_mask_v=attention_mask_v, attention_mask_l=attention_mask_l
+            v, l, attention_mask_v=attention_mask_v, attention_mask_l=attention_mask_l,
+            tracer=tracer, prefix=prefix,
         )
         if self.residual_style == "pre_norm":
             v, l = residual_v, residual_l
-        v = v + self.drop_path(self.gamma_v * delta_v)
-        l = l + self.drop_path(self.gamma_l * delta_l)
+        scaled_v, scaled_l = self.gamma_v * delta_v, self.gamma_l * delta_l
+        dropped_v, dropped_l = self.drop_path(scaled_v), self.drop_path(scaled_l)
+        for side, gamma, delta, scaled, dropped in (("visual", self.gamma_v, delta_v, scaled_v, dropped_v),
+                                                    ("text", self.gamma_l, delta_l, scaled_l, dropped_l)):
+            emit(tracer, f"{prefix}.{side}.gamma", gamma, "D", "parameter", "op")
+            emit(tracer, f"{prefix}.{side}.delta", delta, "B,N,D", "attention", "op")
+            emit(tracer, f"{prefix}.{side}.scaled_delta", scaled, "B,N,D", "multiply", "exhaustive")
+            emit(tracer, f"{prefix}.{side}.drop_path_output", dropped, "B,N,D", "drop_path", "exhaustive")
+        v = v + dropped_v
+        l = l + dropped_l
+        emit(tracer, f"{prefix}.visual.residual_sum", v, "B,V,D", "add", "op")
+        emit(tracer, f"{prefix}.text.residual_sum", l, "B,L,D", "add", "op")
+        emit(tracer, f"{prefix}.visual.after_fusion", v, "B,V,D", "identity", "layer")
+        emit(tracer, f"{prefix}.text.after_fusion", l, "B,L,D", "identity", "layer")
         return v, l
 
     # def forward(self, v:List[torch.Tensor], l, attention_mask_v=None, attention_mask_l=None)

@@ -1,54 +1,82 @@
 from __future__ import annotations
 
+import csv
+import os
+import shutil
 import time
 from pathlib import Path
 
 import torch
 
-from .trace_config import TraceConfig
 from .tensor_record import TensorRecord
+from .trace_config import TraceConfig
 from .trace_utils import (
+    canonical_bytes,
     compute_tensor_stats,
-    sha256_of_bytes,
+    native_bytes,
+    sanitize_filename,
     semantic_name_to_subdir,
-    canonical_f32_bytes,
-    raw_bf16_bytes,
+    sha256_of_bytes,
 )
 
 
+class TraceByteLimitExceeded(RuntimeError):
+    pass
+
+
 class TensorWriter:
-    """Writes tensors to disk in canonical format with manifest and summary CSV."""
+    """Authoritative raw-binary writer.
+
+    The writer stages a whole trace in a sibling temporary directory and only
+    publishes it after ``close(success=True)``. Hitting a byte limit is fatal;
+    an exhaustive trace is never silently truncated.
+    """
+
+    CSV_FIELDS = [
+        "trace_id", "semantic_name", "call_index", "module_path", "operation", "io", "stage",
+        "required_level", "shape", "layout", "source_dtype", "storage_dtype", "native_storage_dtype",
+        "numel", "min", "max", "mean", "std", "abs_max", "l2_norm", "nan_count", "inf_count",
+        "file", "native_file", "sha256_f32", "sha256_native",
+    ]
 
     def __init__(self, trace_dir: Path, config: TraceConfig) -> None:
-        self.trace_dir = trace_dir
+        self.trace_dir = Path(trace_dir)
         self.config = config
         self._trace_counter = 0
         self._total_bytes = 0
-
-        if trace_dir.exists() and not config.overwrite:
-            raise FileExistsError(
-                f"Trace directory {trace_dir} already exists. "
-                f"Use --trace-overwrite to allow overwriting."
-            )
-        self.trace_dir.mkdir(parents=True, exist_ok=True)
-
-        self._manifest_file = open(
-            self.trace_dir / "manifest.jsonl", "w", encoding="utf-8"
-        )
-        self._csv_file = open(
-            self.trace_dir / "summary.csv", "w", encoding="utf-8"
-        )
-        self._csv_file.write(
-            "trace_id,semantic_name,shape,layout,source_dtype,storage_dtype,"
-            "min,max,mean,std,abs_max,l2_norm,nan_count,inf_count,file\n"
-        )
         self._records: list[TensorRecord] = []
+        self._closed = False
+        self._published = False
+
+        if self.trace_dir.exists() and not config.overwrite:
+            raise FileExistsError(f"trace directory already exists: {self.trace_dir}")
+        self._work_dir = (
+            self.trace_dir.with_name(f"{self.trace_dir.name}.tmp.{os.getpid()}")
+            if config.atomic else self.trace_dir
+        )
+        if self._work_dir.exists():
+            shutil.rmtree(self._work_dir)
+        self._work_dir.mkdir(parents=True)
+        self._manifest_file = (self._work_dir / "manifest.jsonl").open("w", encoding="utf-8")
+        self._csv_stream = (self._work_dir / "summary.csv").open("w", newline="", encoding="utf-8")
+        self._csv_writer = csv.DictWriter(self._csv_stream, fieldnames=self.CSV_FIELDS, extrasaction="ignore")
+        self._csv_writer.writeheader()
+
+    def _reserve(self, size: int, semantic_name: str) -> None:
+        requested = self._total_bytes + size
+        if self.config.max_bytes and requested > self.config.max_bytes:
+            raise TraceByteLimitExceeded(
+                f"trace byte limit exceeded by {semantic_name!r}: requested={requested}, "
+                f"limit={self.config.max_bytes}; trace is incomplete"
+            )
 
     def write(
         self,
         *,
         semantic_name: str,
         tensor: torch.Tensor,
+        call_index: int = 0,
+        required_level: str = "boundary",
         layout: str,
         operation: str = "unknown",
         module_path: str | None = None,
@@ -56,146 +84,109 @@ class TensorWriter:
         stage: str | None = None,
         metadata: dict | None = None,
     ) -> TensorRecord | None:
-        """Write a tensor to disk and record its metadata.
-
-        Returns the TensorRecord, or None if the tensor was filtered out.
-        """
-        if not self.config.matches(semantic_name):
+        if not self.config.matches(semantic_name) or not self.config.includes_level(required_level):
             return None
-
-        numel = tensor.numel()
-        if self.config.max_tensor_numel > 0 and numel > self.config.max_tensor_numel:
-            return None
-
-        if self.config.max_bytes > 0 and self._total_bytes > self.config.max_bytes:
-            return None
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"trace value {semantic_name!r} is not a tensor")
+        if self.config.max_tensor_numel and tensor.numel() > self.config.max_tensor_numel:
+            raise TraceByteLimitExceeded(
+                f"tensor {semantic_name!r} has {tensor.numel()} elements, exceeding configured limit "
+                f"{self.config.max_tensor_numel}; trace is incomplete"
+            )
 
         trace_id = self._trace_counter
-        self._trace_counter += 1
+        cpu = tensor.detach().to(device="cpu", copy=True).contiguous()
+        canonical, storage_dtype, canonical_suffix = canonical_bytes(cpu)
+        native, native_storage_dtype, native_suffix = native_bytes(cpu)
+        save_native_separately = self.config.save_native and (
+            native_storage_dtype != storage_dtype or native != canonical
+        )
+        bytes_to_write = (len(canonical) if self.config.save_f32 else 0) + (
+            len(native) if save_native_separately else 0
+        )
+        self._reserve(bytes_to_write, semantic_name)
 
-        # Record original dtype before any conversion.
-        source_dtype = str(tensor.dtype)
-
-        # Snapshot: detach, CPU, contiguous.
-        # copy=True ensures we capture the current state even if the tensor
-        # is mutated in-place later.
-        t_cpu = tensor.detach().to(device="cpu", copy=True).contiguous()
-
-        # Stats.
-        if self.config.save_stats:
-            stats = compute_tensor_stats(
-                t_cpu, num_first_last=self.config.save_first_last_values
-            )
-        else:
-            stats = compute_tensor_stats(torch.tensor([]))
-
-        # Determine stage from semantic name if not provided.
-        if not stage:
-            stage = semantic_name.split(".")[0]
-
-        # Build output subdirectory.
-        subdir = semantic_name_to_subdir(semantic_name)
-        save_dir = self.trace_dir / subdir
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        filename_base = f"{trace_id:04d}__{semantic_name.replace('.', '__')}"
-
-        # --- Canonical float32 binary ---
-        f32_bytes = canonical_f32_bytes(t_cpu)
-        rel_f32_path = ""
+        safe = sanitize_filename(semantic_name)
+        base = f"{trace_id:06d}__{safe}__call_{call_index:02d}"
+        canonical_dir = self._work_dir / semantic_name_to_subdir(semantic_name)
+        canonical_dir.mkdir(parents=True, exist_ok=True)
+        canonical_path = canonical_dir / f"{base}.{canonical_suffix}.bin"
+        file_rel = ""
         if self.config.save_f32:
-            f32_path = save_dir / f"{filename_base}.f32le.bin"
-            f32_path.write_bytes(f32_bytes)
-            rel_f32_path = f32_path.relative_to(self.trace_dir).as_posix()
-            self._total_bytes += len(f32_bytes)
+            canonical_path.write_bytes(canonical)
+            file_rel = canonical_path.relative_to(self._work_dir).as_posix()
 
-        sha256_hash = sha256_of_bytes(f32_bytes)
+        native_rel = None
+        if save_native_separately:
+            native_dir = self._work_dir / semantic_name_to_subdir(semantic_name, native=True)
+            native_dir.mkdir(parents=True, exist_ok=True)
+            native_path = native_dir / f"{base}.{native_suffix}.bin"
+            native_path.write_bytes(native)
+            native_rel = native_path.relative_to(self._work_dir).as_posix()
 
-        # --- PyTorch .pt ---
-        pt_path_str = None
-        if self.config.save_pt:
-            pt_path = save_dir / f"{filename_base}.pt"
-            torch.save(t_cpu, pt_path)
-            pt_path_str = pt_path.relative_to(self.trace_dir).as_posix()
-
-        # --- Raw BF16 ---
-        raw_bf16_str = None
-        if self.config.save_raw_bf16 and tensor.dtype == torch.bfloat16:
-            bf16_data = raw_bf16_bytes(t_cpu.to(torch.bfloat16))
-            if bf16_data:
-                bf16_path = save_dir / f"{filename_base}.bf16le.bin"
-                bf16_path.write_bytes(bf16_data)
-                raw_bf16_str = bf16_path.relative_to(self.trace_dir).as_posix()
-                self._total_bytes += len(bf16_data)
-
-        # --- Build record ---
+        stats = compute_tensor_stats(cpu, self.config.save_first_last_values) if self.config.save_stats else compute_tensor_stats(torch.tensor([]))
+        stage = stage or semantic_name.split(".")[0]
         record = TensorRecord(
-            trace_id=trace_id,
-            semantic_name=semantic_name,
-            module_path=module_path,
-            operation=operation,
-            call_index=0,
-            io=io,
-            stage=stage,
-            shape=list(t_cpu.shape),
-            layout=layout,
-            strides=list(t_cpu.stride()),
-            source_dtype=source_dtype,
-            storage_dtype="float32",
-            endianness="little",
-            contiguous=t_cpu.is_contiguous(),
-            numel=numel,
-            file=rel_f32_path,
-            pt_file=pt_path_str,
-            raw_bf16_file=raw_bf16_str,
-            min=stats["min"],
-            max=stats["max"],
-            mean=stats["mean"],
-            std=stats["std"],
-            abs_max=stats["abs_max"],
-            l1_norm=stats["l1_norm"],
-            l2_norm=stats["l2_norm"],
-            zero_count=stats["zero_count"],
-            zero_ratio=stats["zero_ratio"],
-            nan_count=stats["nan_count"],
-            inf_count=stats["inf_count"],
-            first_values=stats["first_values"],
-            last_values=stats["last_values"],
-            sha256_f32=sha256_hash,
-            timestamp_ns=time.time_ns(),
+            trace_id=trace_id, semantic_name=semantic_name, call_index=call_index,
+            module_path=module_path, operation=operation, io=io, stage=stage,
+            required_level=required_level, shape=list(cpu.shape), layout=layout,
+            strides=list(cpu.stride()), source_dtype=str(tensor.dtype), storage_dtype=storage_dtype,
+            native_storage_dtype=native_storage_dtype, contiguous=cpu.is_contiguous(), numel=cpu.numel(),
+            file=file_rel, native_file=native_rel, sha256_f32=sha256_of_bytes(canonical) if cpu.is_floating_point() else None,
+            sha256_native=sha256_of_bytes(native), timestamp_ns=time.time_ns(), **stats,
         )
-
         self._records.append(record)
+        self._trace_counter += 1
+        self._total_bytes += bytes_to_write
         self._manifest_file.write(record.to_jsonl_line())
+        row = record.to_dict()
+        row["shape"] = "x".join(map(str, record.shape)) if record.shape else "scalar"
+        self._csv_writer.writerow(row)
         self._manifest_file.flush()
-
-        self._csv_file.write(record.to_csv_row())
-        self._csv_file.flush()
-
-        print(
-            f"[trace] {trace_id:04d} {semantic_name} "
-            f"shape={record.shape} dtype={source_dtype} "
-            f"min={record.min:.4f} max={record.max:.4f} mean={record.mean:.4f}",
-            flush=True,
-        )
-
-        if self.config.fail_on_nan and record.nan_count > 0:
-            raise ValueError(
-                f"NaN detected in tensor '{semantic_name}': {record.nan_count} NaN values"
-            )
-
+        self._csv_stream.flush()
+        expected_infinity = semantic_name.endswith(("masked_logits", "softmax.shifted"))
+        if self.config.fail_on_nan and (record.nan_count or (record.inf_count and not expected_infinity)):
+            raise ValueError(f"NaN detected in tensor {semantic_name!r}: nan={record.nan_count}, inf={record.inf_count}")
         return record
 
-    def close(self) -> None:
-        """Flush and close manifest and CSV files."""
-        if not self._manifest_file.closed:
-            self._manifest_file.close()
-        if not self._csv_file.closed:
-            self._csv_file.close()
+    def write_auxiliary_text(self, relative_path: str, value: str) -> None:
+        path = self._work_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
+
+    def close(self, *, success: bool = True) -> None:
+        if self._closed:
+            return
+        self._manifest_file.close()
+        self._csv_stream.close()
+        self._closed = True
+        if success and self.config.atomic:
+            if self.trace_dir.exists():
+                old = self.trace_dir.with_name(f"{self.trace_dir.name}.old.{os.getpid()}")
+                if old.exists():
+                    shutil.rmtree(old)
+                self.trace_dir.rename(old)
+                self._work_dir.rename(self.trace_dir)
+                shutil.rmtree(old)
+            else:
+                self._work_dir.rename(self.trace_dir)
+            self._published = True
+        elif success:
+            self._published = True
+        elif self._work_dir.exists():
+            shutil.rmtree(self._work_dir)
+
+    @property
+    def work_dir(self) -> Path:
+        return self._work_dir
 
     @property
     def record_count(self) -> int:
         return self._trace_counter
+
+    @property
+    def total_bytes(self) -> int:
+        return self._total_bytes
 
     @property
     def records(self) -> list[TensorRecord]:

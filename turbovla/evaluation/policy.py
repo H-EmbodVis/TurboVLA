@@ -11,12 +11,16 @@ import json
 import math
 import os
 import random
+import warnings
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Sequence
 
 import numpy as np
 from PIL import Image
 import torch
+
+from .model_loader import load_turbovla_for_inference
 
 
 EXPECTED_IMAGE_SIZE = 256
@@ -393,7 +397,7 @@ class TurboVLAPolicy:
         if not allow_hf_download and not os.path.isdir(self.bert_path):
             raise FileNotFoundError(f"local BERT directory not found: {self.bert_path}")
 
-        build_model, loaded_model_path = load_turbovla_builder()
+        loaded_model_path = "turbovla.evaluation.model_loader.load_turbovla_for_inference"
         if self.verbose:
             print(f"[TurboVLAPolicy] model source: {loaded_model_path}", flush=True)
             print(
@@ -402,61 +406,23 @@ class TurboVLAPolicy:
                 f"dinov3_output_hidden_states={self.dinov3_output_hidden_states}",
                 flush=True,
             )
-        self._checkpoint = torch.load(self.ckpt_path, map_location="cpu")
-        model_config = self._checkpoint.get("model_config") if isinstance(self._checkpoint, dict) else None
-        if model_config is not None:
-            from ..models.configuration import TurboVLAConfig
-
-            config = TurboVLAConfig.from_mapping(model_config)
-            config.text.model_name_or_path = self.bert_path
-            config.text.local_files_only = not allow_hf_download
-            config.vision.model_name_or_path = self.dinov3_path
-            config.vision.local_files_only = not allow_hf_download
-            config.vision.compute_precision = "bf16" if self.precision == "bf16" else "bf16_autocast"
-            config.embedding_dump.enabled = dump_embeddings
-            config.embedding_dump.output_dir = embedding_dump_dir
-            config.embedding_dump.max_dumps = embedding_dump_max
-            config.embedding_dump.every_n_forwards = embedding_dump_every
-            config.embedding_dump.print_summary = embedding_dump_print_summary
-            config.embedding_dump.preview_values = embedding_dump_preview_values
-            config.__post_init__()
-            self.chunk_size = config.action.horizon
-            self.action_dim = config.action.action_dim
-            self.model = build_model(config)
-        else:
-            model_args = _make_model_args(
-                dinov3_path=self.dinov3_path,
-                bert_path=self.bert_path,
-                hidden_dim=hidden_dim,
-                nheads=nheads,
-                dim_feedforward=dim_feedforward,
-                max_text_len=max_text_len,
-                text_padding_length=text_padding_length,
-                vla_feature_enhancer_layers=vla_feature_enhancer_layers,
-                enhancer_inner_dim=enhancer_inner_dim,
-                action_dim=action_dim,
-                chunk_size=chunk_size,
-                state_dim=state_dim,
-                num_state_tokens=num_state_tokens,
-                text_dropout=text_dropout,
-                fusion_dropout=fusion_dropout,
-                fusion_droppath=fusion_droppath,
-                sub_sentence_present=sub_sentence_present,
-                precision=self.precision,
-                allow_hf_download=allow_hf_download,
-                dump_embeddings=dump_embeddings,
-                embedding_dump_dir=embedding_dump_dir,
-                embedding_dump_max=embedding_dump_max,
-                embedding_dump_every=embedding_dump_every,
-                embedding_dump_print_summary=embedding_dump_print_summary,
-                embedding_dump_preview_values=embedding_dump_preview_values,
+        if allow_hf_download:
+            raise ValueError("production inference requires explicit local BERT and DINO paths")
+        loaded = load_turbovla_for_inference(
+            checkpoint_path=Path(self.ckpt_path), dinov3_path=self.dinov3_path,
+            bert_path=self.bert_path, device=self.device, precision=self.precision,
+            strict=True, deterministic=False,
+        )
+        self.loaded_model = loaded
+        self.model = loaded.model
+        self.chunk_size = loaded.config.action.horizon
+        self.action_dim = loaded.config.action.action_dim
+        if dump_embeddings:
+            warnings.warn(
+                "EmbeddingDumper is legacy-only and is not valid for parity output",
+                DeprecationWarning, stacklevel=2,
             )
-            self.model = build_model(model_args)
-        self._load_checkpoint()
-        self._set_eval_precision()
-        self.model.to(self.device)
-        self.model.eval()
-        self.model.requires_grad_(False)
+            self.model.embedding_dumper.config.enabled = True
         self._verify_model_precision()
         self.dinov3_processor = build_dinov3_manual_processor(self.dinov3_path)
 
@@ -540,13 +506,26 @@ class TurboVLAPolicy:
 
         samples, states = self._build_batch([primary_image], [wrist_image], [state])
         samples, states = self._prepare_model_inputs(samples, states)
-        with torch.inference_mode():
-            pred = self.model([instruction], samples, states)
+        tracer = getattr(self.model, "_parity_tracer", None)
+        started = False
+        if tracer is not None and not tracer.active:
+            started = tracer.begin(forward_index=0, fixture_id=getattr(tracer, "requested_fixture_id", ""))
+        try:
+            with torch.inference_mode():
+                pred = self.model([instruction], samples, states)
+            if tracer is not None and tracer.active:
+                tracer.tensor("action.normalized", pred, layout="B,T,A", operation="tanh", required_level="boundary")
+        except Exception as error:
+            if started:
+                tracer.finish(error=error)
+            raise
         if pred.dtype != self.model_dtype:
             raise RuntimeError(
                 f"precision={self.precision} expected forward output dtype {self.model_dtype}, got {pred.dtype}"
             )
-        return sanitize_pred_chunk(pred.detach().float().cpu().numpy()[0])
+        result = sanitize_pred_chunk(pred.detach().float().cpu().numpy()[0])
+        # Lifecycle remains open for environment-action postprocessing.
+        return result
 
     def set_parity_tracer(self, tracer) -> None:
         if hasattr(self.model, "set_parity_tracer"):
@@ -570,9 +549,13 @@ class TurboVLAPolicy:
         )
         tracer = getattr(self.model, "_parity_tracer", None)
         if tracer is not None and tracer.active:
-            tracer.tensor("action.denormalized", torch.from_numpy(env_actions), layout="T,A", operation="denormalize")
+            tracer.tensor("action.denormalized", torch.from_numpy(env_actions), layout="T,A", operation="denormalize", required_level="boundary")
         if execute_steps is not None:
             env_actions = env_actions[: int(execute_steps)]
+        if tracer is not None and tracer.active:
+            tracer.tensor("action.first_step", torch.from_numpy(env_actions[:1]), layout="T,A", operation="slice", required_level="boundary")
+            tracer.tensor("action.executed_steps", torch.from_numpy(env_actions), layout="T,A", operation="slice", required_level="boundary")
+            tracer.finish()
         return env_actions.astype(np.float32)
 
     def predict_env_action_chunk_from_obs(

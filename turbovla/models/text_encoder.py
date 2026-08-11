@@ -5,11 +5,13 @@ from contextlib import nullcontext
 from typing import Any, Callable, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import AutoModel, AutoTokenizer
 
 from ..text.bert import BertModelWarper, generate_masks_with_special_tokens
 from .configuration import TextEncoderConfig
+from ..debug.model_trace import emit, trace_layer_norm, trace_linear, trace_softmax
 
 
 def _load_pretrained_model(config: TextEncoderConfig):
@@ -125,21 +127,29 @@ class TurboVLATextEncoder(nn.Module):
             hook = self.bert.embeddings.register_forward_hook(dump_bert_input)
 
         if tracer is not None and tracer.active:
-            tracer.tensor("text.input_ids", tokenized.input_ids, layout="B,N", operation="tokenizer")
-            tracer.tensor("text.attention_mask", tokenized.attention_mask, layout="B,N", operation="tokenizer")
+            valid_length = int(tokenized.attention_mask.sum(dim=1).max())
+            token_type_ids = tokenized.get("token_type_ids", torch.zeros_like(tokenized.input_ids))
+            tracer.tensor("text.tokenizer.input_ids_unpadded", tokenized.input_ids[:, :valid_length], layout="B,L", operation="tokenizer", required_level="op")
+            tracer.tensor("text.tokenizer.token_type_ids_unpadded", token_type_ids[:, :valid_length], layout="B,L", operation="tokenizer", required_level="op")
+            tracer.tensor("text.tokenizer.attention_mask_unpadded", tokenized.attention_mask[:, :valid_length].bool(), layout="B,L", operation="tokenizer", required_level="op")
+            tracer.tensor("text.tokenizer.self_attention_mask_unpadded", text_self_attention_masks[:, :valid_length, :valid_length], layout="B,L,L", operation="tokenizer", required_level="op")
+            tracer.tensor("text.tokenizer.position_ids_unpadded", position_ids[:, :valid_length], layout="B,L", operation="tokenizer", required_level="op")
+            tracer.tensor("text.layout.input_ids_padded", tokenized.input_ids, layout="B,N", operation="padding", required_level="boundary")
+            tracer.tensor("text.layout.attention_mask_padded", tokenized.attention_mask.bool(), layout="B,N", operation="padding", required_level="boundary")
+            tracer.tensor("text.layout.key_padding_mask_padded", ~tokenized.attention_mask.bool(), layout="B,N", operation="invert", required_level="op")
             if text_self_attention_masks is not None:
-                tracer.tensor("text.text_self_attention_mask", text_self_attention_masks, layout="B,N,N", operation="tokenizer")
-            tracer.tensor("text.position_ids", position_ids, layout="B,N", operation="tokenizer")
-
-            def trace_embeddings(_module, _inputs, output):
-                tracer.tensor("text.bert.embeddings", output, layout="B,N,D", operation="embedding")
-
-            embedding_hook = self.bert.embeddings.register_forward_hook(trace_embeddings)
+                tracer.tensor("text.layout.self_attention_mask_padded", text_self_attention_masks, layout="B,N,N", operation="padding", required_level="boundary")
+            tracer.tensor("text.layout.position_ids_padded", position_ids, layout="B,N", operation="padding", required_level="boundary")
+            tracer.tensor("text.bert.embeddings.input_ids", tokenized.input_ids, layout="B,N", operation="input", required_level="op")
 
         grad_context = torch.no_grad() if self.config.frozen else nullcontext()
         try:
             with grad_context:
-                bert_output = self.bert(**bert_inputs)
+                bert_output = self.bert(
+                    **bert_inputs,
+                    output_hidden_states=bool(tracer is not None and tracer.active),
+                    output_attentions=False,
+                )
         finally:
             if hook is not None:
                 hook.remove()
@@ -147,13 +157,94 @@ class TurboVLATextEncoder(nn.Module):
                 embedding_hook.remove()
 
         if tracer is not None and tracer.active:
-            tracer.tensor("text.bert.last_hidden_state", bert_output.last_hidden_state, layout="B,N,D", operation="bert_output")
+            self._trace_bert_math(
+                tracer, tokenized.input_ids, tokenized.get("token_type_ids", torch.zeros_like(tokenized.input_ids)),
+                position_ids, text_self_attention_masks if self.config.sub_sentence_present else tokenized.attention_mask.bool(),
+                bert_output,
+            )
 
         return (
             bert_output.last_hidden_state,
             tokenized.attention_mask.bool(),
             text_self_attention_masks,
         )
+
+    def _trace_bert_math(self, tracer, input_ids, token_type_ids, position_ids, attention_mask, output):
+        embeddings = self.bert.embeddings
+        word = embeddings.word_embeddings(input_ids)
+        token_type = embeddings.token_type_embeddings(token_type_ids)
+        position = embeddings.position_embeddings(position_ids)
+        summed = word + token_type + position
+        emit(tracer, "text.bert.embeddings.word", word, "B,N,D", "embedding", "op")
+        emit(tracer, "text.bert.embeddings.token_type", token_type, "B,N,D", "embedding", "op")
+        emit(tracer, "text.bert.embeddings.position", position, "B,N,D", "embedding", "op")
+        emit(tracer, "text.bert.embeddings.sum_before_norm", summed, "B,N,D", "add", "exhaustive")
+        trace_layer_norm(tracer, "text.bert.embeddings.norm", summed, embeddings.LayerNorm,
+                         layout="B,N,D", include_parameters=True)
+        embedding_output = output.hidden_states[0]
+        emit(tracer, "text.bert.embeddings.output", embedding_output, "B,N,D", "dropout", "layer")
+
+        if attention_mask.dim() == 2:
+            allowed = attention_mask[:, None, None, :].bool()
+        else:
+            allowed = attention_mask[:, None, :, :].bool()
+        for index, layer in enumerate(self.bert.encoder.layer):
+            prefix = f"text.bert.layer_{index:02d}"
+            hidden = output.hidden_states[index]
+            emit(tracer, f"{prefix}.input", hidden, "B,N,D", "layer_input", "layer")
+            attention = layer.attention.self
+            q = trace_linear(tracer, f"{prefix}.attn.q_linear", hidden, attention.query)
+            k = trace_linear(tracer, f"{prefix}.attn.k_linear", hidden, attention.key)
+            v = trace_linear(tracer, f"{prefix}.attn.v_linear", hidden, attention.value)
+            batch, length = hidden.shape[:2]
+            heads, head_dim = attention.num_attention_heads, attention.attention_head_size
+            q_reshape = q.view(batch, length, heads, head_dim)
+            k_reshape = k.view(batch, length, heads, head_dim)
+            v_reshape = v.view(batch, length, heads, head_dim)
+            qh, kh, vh = (item.permute(0, 2, 1, 3) for item in (q_reshape, k_reshape, v_reshape))
+            for name, reshaped, transposed in (("q", q_reshape, qh), ("k", k_reshape, kh), ("v", v_reshape, vh)):
+                emit(tracer, f"{prefix}.attn.{name}.reshape", reshaped, "B,N,H,Dh", "reshape", "exhaustive")
+                emit(tracer, f"{prefix}.attn.{name}.transpose", transposed, "B,H,N,Dh", "transpose", "exhaustive")
+            kt = kh.transpose(-1, -2)
+            logits = torch.matmul(qh, kt)
+            scale = torch.tensor(head_dim ** 0.5, dtype=hidden.dtype, device=hidden.device)
+            scaled = logits / scale
+            expanded_allowed = allowed.expand(batch, heads, length, length)
+            mask = ~expanded_allowed
+            masked = scaled.masked_fill(mask, torch.finfo(scaled.dtype).min)
+            emit(tracer, f"{prefix}.attn.k_transposed", kt, "B,H,Dh,N", "transpose", "exhaustive")
+            emit(tracer, f"{prefix}.attn.qk_matmul", logits, "B,H,N,N", "matmul", "op")
+            emit(tracer, f"{prefix}.attn.scale", scale, "", "constant", "exhaustive")
+            emit(tracer, f"{prefix}.attn.scaled_logits", scaled, "B,H,N,N", "divide", "op")
+            emit(tracer, f"{prefix}.attn.mask", mask, "B,H,N,N", "mask", "op")
+            emit(tracer, f"{prefix}.attn.masked_logits", masked, "B,H,N,N", "masked_fill", "op")
+            probs = trace_softmax(tracer, f"{prefix}.attn.softmax", masked, layout="B,H,N,N", output_dtype=hidden.dtype)
+            context_heads = torch.matmul(probs, vh)
+            context_transpose = context_heads.permute(0, 2, 1, 3).contiguous()
+            context = context_transpose.view(batch, length, -1)
+            emit(tracer, f"{prefix}.attn.context_heads", context_heads, "B,H,N,Dh", "matmul", "op")
+            emit(tracer, f"{prefix}.attn.context_transpose", context_transpose, "B,N,H,Dh", "transpose", "exhaustive")
+            emit(tracer, f"{prefix}.attn.context_merged", context, "B,N,D", "reshape", "op")
+            attn_out = trace_linear(tracer, f"{prefix}.attn.output", context, layer.attention.output.dense)
+            emit(tracer, f"{prefix}.attn.output", attn_out, "B,N,D", "linear", "layer")
+            emit(tracer, f"{prefix}.residual_1.left", hidden, "B,N,D", "identity", "exhaustive")
+            emit(tracer, f"{prefix}.residual_1.right", attn_out, "B,N,D", "identity", "exhaustive")
+            residual_1 = hidden + attn_out
+            emit(tracer, f"{prefix}.residual_1.sum", residual_1, "B,N,D", "add", "op")
+            trace_layer_norm(tracer, f"{prefix}.norm_1", residual_1, layer.attention.output.LayerNorm)
+            norm_1 = layer.attention.output.LayerNorm(residual_1)
+            linear_1 = trace_linear(tracer, f"{prefix}.ffn.linear_1", norm_1, layer.intermediate.dense)
+            gelu = layer.intermediate.intermediate_act_fn(linear_1)
+            emit(tracer, f"{prefix}.ffn.gelu.input", linear_1, "B,N,F", "gelu", "exhaustive")
+            emit(tracer, f"{prefix}.ffn.gelu.output", gelu, "B,N,F", "gelu", "op")
+            linear_2 = trace_linear(tracer, f"{prefix}.ffn.linear_2", gelu, layer.output.dense)
+            emit(tracer, f"{prefix}.residual_2.left", norm_1, "B,N,D", "identity", "exhaustive")
+            emit(tracer, f"{prefix}.residual_2.right", linear_2, "B,N,D", "identity", "exhaustive")
+            residual_2 = norm_1 + linear_2
+            emit(tracer, f"{prefix}.residual_2.sum", residual_2, "B,N,D", "add", "op")
+            trace_layer_norm(tracer, f"{prefix}.norm_2", residual_2, layer.output.LayerNorm)
+            emit(tracer, f"{prefix}.output", output.hidden_states[index + 1], "B,N,D", "layer_output", "layer")
+        emit(tracer, "text.bert.last_hidden_state_unpadded", output.last_hidden_state, "B,N,D", "bert_output", "boundary")
 
     def encode_bert_hidden(
         self,
@@ -218,8 +309,13 @@ class TurboVLATextEncoder(nn.Module):
             dump("text.token_mask", text_token_mask)
 
         hidden = hidden.to(dtype=self.text_projection.weight.dtype)
+        emit(tracer, "text.bert.hidden_padded", hidden, "B,N,D", "padding", "boundary")
+        emit(tracer, "text.projection.input", hidden, "B,N,D", "input", "op")
+        traced_projection = trace_linear(tracer, "text.projection", hidden, self.text_projection)
+        emit(tracer, "text.projection.before_zero_fill", traced_projection, "B,N,D", "identity", "exhaustive")
         text_tokens = self.text_projection(hidden)
         text_key_padding_mask = ~text_token_mask
+        emit(tracer, "text.projection.zero_fill_mask", text_key_padding_mask, "B,N", "mask", "exhaustive")
         if self.config.zero_padded_tokens:
             text_tokens = text_tokens.masked_fill(text_key_padding_mask.unsqueeze(-1), 0.0)
         if dump is not None:
