@@ -1515,6 +1515,62 @@ body {
   line-height: 1.1;
 }
 
+.real-world-task-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.real-world-task-card {
+  min-width: 0;
+}
+
+.real-world-task-card figcaption {
+  padding: 0 2px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  color: var(--ink);
+  text-align: left;
+}
+
+.real-world-task-card figcaption span {
+  color: var(--green);
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.real-world-task-card figcaption strong {
+  color: var(--ink);
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 17px;
+  font-weight: 500;
+  line-height: 1.15;
+}
+
+.real-world-task-card video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(23, 33, 31, 0.1);
+  background: #050708;
+}
+
+.real-world-task-note {
+  margin: 2px 2px 0;
+  color: var(--muted);
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  text-align: left;
+}
+
 .inference-mode {
   margin-left: auto;
   padding: 5px 8px;
@@ -1947,6 +2003,10 @@ footer {
     font-size: 16px;
   }
 
+  .real-world-task-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .method-notes {
     grid-template-columns: 1fr;
   }
@@ -2009,6 +2069,11 @@ footer {
     gap: 46px;
   }
 
+  .real-world-task-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 22px 14px;
+  }
+
   .real-world-card figcaption {
     padding: 0 0 11px;
     align-items: center;
@@ -2021,6 +2086,10 @@ footer {
 
   .real-world-card figcaption strong {
     font-size: 20px;
+  }
+
+  .real-world-task-card figcaption strong {
+    font-size: 16px;
   }
 
   .paper-reading {
