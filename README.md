@@ -196,7 +196,7 @@ One command evaluates one checkpoint on one suite.
 
 ```bash
 python experiments/libero/evaluate.py \
-  --ckpt_path pretrained/TurboVLA/checkpoints/libero/libero_object.pth \
+  --ckpt_path pretrained/TurboVLA/checkpoints/libero/turbovla_libero.pth \
   --dinov3_path /path/to/dinov3-vitb \
   --bert_path /path/to/bert-base-uncased \
   --stats_path experiments/libero/configs/libero_all4_stats.json \
