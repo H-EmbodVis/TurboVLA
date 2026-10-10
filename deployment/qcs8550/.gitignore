@@ -1,0 +1,4 @@
+# All files produced by export, AI Hub compilation, replay, and rollout are local deployment assets.
+artifacts/
+__pycache__/
+tools/__pycache__/

@@ -33,6 +33,7 @@ This repository contains the official implementation of **TurboVLA** for the pap
 
 ## 📅 TODO
 * [ ] Support Huawei Ascend NPUs
+* [x] Experimental Qualcomm QCS8550 QNN deployment for LIBERO Object: see [deployment/qcs8550](deployment/qcs8550/README.md)
 ---
 
 ## 📄 Abstract
