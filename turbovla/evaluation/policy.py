@@ -265,6 +265,25 @@ def _checkpoint_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
     )
 
 
+# transformers 5 nests DINOv3's blocks under `.model` (layer.* -> model.layer.*); released checkpoints use the 4.x names.
+_BACKBONE_RENAMES = (("vision_encoder.backbone.layer.", "vision_encoder.backbone.model.layer."),)
+
+
+def align_backbone_keys(state_dict: dict[str, torch.Tensor], target_keys) -> dict[str, torch.Tensor]:
+    """Rename backbone keys between the transformers 4.x and 5.x layouts, in the direction the model needs."""
+    target_keys = set(target_keys)
+    out = {}
+    for key, value in state_dict.items():
+        new = key
+        if key not in target_keys:
+            for old, cur in _BACKBONE_RENAMES:
+                for a, b in ((old, cur), (cur, old)):
+                    if key.startswith(a) and b + key[len(a):] in target_keys:
+                        new = b + key[len(a):]
+        out[new] = value
+    return out
+
+
 def _strip_module_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     cleaned = {}
     for key, value in state_dict.items():
@@ -467,6 +486,7 @@ class TurboVLAPolicy:
 
     def _load_checkpoint(self) -> None:
         source_state = _strip_module_prefix(_checkpoint_state_dict(self._checkpoint))
+        source_state = align_backbone_keys(source_state, self.model.state_dict().keys())
         self.model.load_state_dict(source_state, strict=True)
         if self.verbose:
             print(
