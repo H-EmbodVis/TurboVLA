@@ -7,7 +7,7 @@ name = "turbovla"
 version = "0.1.0"
 description = "TurboVLA training and evaluation for LIBERO and RoboTwin 2.0"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = {file = "LICENSE"}
 dependencies = [
   "numpy>=1.26,<2",
@@ -19,16 +19,38 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Reference LIBERO Python packages; keep these pins scoped to this extra.
+# Install the CUDA 12.1 PyTorch wheels first (see README.md).
 libero = [
-  "bddl",
-  "cloudpickle",
-  "easydict",
-  "gym",
-  "h5py>=3.10",
-  "imageio[ffmpeg]>=2.34",
-  "robosuite==1.4.1",
-  "tensorflow>=2.20",
-  "tensorflow-datasets>=4.9",
+  "torch==2.3.1",
+  "torchvision==0.18.1",
+  "transformers==4.56.0",
+  "tokenizers==0.22.2",
+  "timm==1.0.25",
+  "numpy==1.26.4",
+  "Pillow==11.3.0",
+  "huggingface-hub==0.36.2",
+  "safetensors==0.7.0",
+  "bddl==1.0.1",
+  "cloudpickle==2.1.0",
+  "easydict==1.9",
+  "gym==0.25.2",
+  "h5py==3.14.0",
+  "imageio[ffmpeg]==2.37.2",
+  "matplotlib==3.9.4",
+  "mujoco==2.3.7",
+  "robosuite==1.4.0",
+  "PyOpenGL==3.1.10",
+  "glfw==2.10.0",
+  "opencv-python==4.6.0.66",
+  "scipy==1.13.1",
+  "numba==0.60.0",
+  "llvmlite==0.43.0",
+  "tensorflow-cpu==2.20.0",
+  "tensorflow-datasets==4.9.3",
+  "tensorflow-metadata==1.17.3",
+  "keras==3.10.0",
+  "protobuf==6.32.0",
 ]
 robotwin = [
   "accelerate==1.5.2",
@@ -76,7 +98,7 @@ include = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

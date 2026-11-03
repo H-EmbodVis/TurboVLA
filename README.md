@@ -79,20 +79,23 @@ git clone https://github.com/H-EmbodVis/TurboVLA.git
 cd TurboVLA
 ```
 
-LIBERO and RoboTwin use different simulator and data stacks. We recommend separate Python 3.10 environments.
+LIBERO and RoboTwin use different simulator and data stacks. Use separate environments: Python 3.9.25 for the LIBERO reference environment and Python 3.10 for RoboTwin.
 
 ### LIBERO Environment
 
 ```bash
-conda create -n turbovla-libero python=3.10 -y
+conda create -n turbovla-libero python=3.9.25 -y
 conda activate turbovla-libero
+export PYTHONNOUSERSITE=1
 
-# Install the CUDA-compatible PyTorch build for your system first.
-pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
-pip install -e ".[libero]"
+# Use the reference CUDA 12.1 PyTorch build before installing project dependencies.
+python -m pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -e ".[libero]"
 ```
 
-Install [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) separately in the same environment.
+Install [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) separately in the same environment, then rerun `python -m pip install -e ".[libero]"` and `python -m pip check` to check the pinned dependencies. The LIBERO extra pins the reference Python packages, including `transformers==4.56.0`, `mujoco==2.3.7`, and `robosuite==1.4.0`.
+
+Reference evaluation uses **OSMesa / Mesa 21.2.6 / llvmpipe LLVM 12.0.0**. Install the native renderer separately and configure its library paths before starting Python; see the [LIBERO environment instructions](experiments/libero/README.md#environment). Python package pins alone do not fix the native renderer or the LIBERO source and assets.
 
 ### RoboTwin Environment
 
@@ -118,7 +121,7 @@ Model weights and benchmark datasets are external assets and are not committed t
 Download the complete TurboVLA release, including model weights and normalization metadata, from [Hugging Face](https://huggingface.co/H-EmbodVis/TurboVLA):
 
 ```bash
-pip install -U huggingface_hub
+python -m pip install huggingface_hub==0.36.2
 hf download H-EmbodVis/TurboVLA \
   --local-dir pretrained/TurboVLA
 ```
@@ -195,6 +198,10 @@ torchrun --nproc_per_node=4 experiments/libero/train.py \
 One command evaluates one checkpoint on one suite.
 
 ```bash
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
+export USE_TORCH=1 USE_TF=0 USE_FLAX=0
+export PYTHONNOUSERSITE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python experiments/libero/evaluate.py \
   --ckpt_path pretrained/TurboVLA/checkpoints/libero/turbovla_libero.pth \
   --dinov3_path /path/to/dinov3-vitb \
@@ -203,6 +210,7 @@ python experiments/libero/evaluate.py \
   --stats_key libero_all4_no_noops \
   --task_suite_name libero_object \
   --num_trials_per_task 50 \
+  --num_steps_wait 10 --env_img_res 256 \
   --chunk_size 12 \
   --num_open_loop_steps 12 \
   --seed 7 \

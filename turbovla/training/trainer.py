@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument("--head_weight_decay", type=float, default=1e-10)
     parser.add_argument("--dinov3_weight_decay", type=float, default=1e-10)
     parser.add_argument("--precision", type=str, default="fp32", choices=["fp32", "bf16_amp"])
-    parser.add_argument("--max_steps", type=int, default=80000)
+    parser.add_argument("--max_steps", type=int, default=40000)
     parser.add_argument(
         "--lr_schedule_steps",
         type=int,

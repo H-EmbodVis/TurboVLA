@@ -15,13 +15,41 @@ evaluate.py                 public single-checkpoint evaluation entry point
 
 ## Environment
 
-The reference environment used PyTorch 2.3.1, torchvision 0.18.1, transformers 4.56, TensorFlow 2.20, and tensorflow-datasets 4.9.3.
+Use the following Linux reference environment for the published checkpoint. The Python package pins are scoped to the `libero` extra in `pyproject.toml`; use a separate environment for RoboTwin.
+
+| Component | Reference version |
+| --- | --- |
+| OS / Python | Ubuntu 20.04 / Python 3.9.25 |
+| PyTorch / torchvision | 2.3.1+cu121 / 0.18.1 (CUDA 12.1 wheels) |
+| transformers / tokenizers / timm | 4.56.0 / 0.22.2 / 1.0.25 |
+| NumPy / Pillow | 1.26.4 / 11.3.0 |
+| MuJoCo / robosuite | 2.3.7 / 1.4.0 |
+| PyOpenGL / glfw | 3.1.10 / 2.10.0 |
+| tensorflow-cpu / tensorflow-datasets | 2.20.0 / 4.9.3 |
+| Renderer | OSMesa, Mesa 21.2.6, llvmpipe LLVM 12.0.0 |
+
+Run the following from the repository root:
 
 ```bash
-pip install -e ".[libero]"
+conda create -n turbovla-libero python=3.9.25 -y
+conda activate turbovla-libero
+export PYTHONNOUSERSITE=1
+
+# Use the reference CUDA 12.1 PyTorch build before installing project dependencies.
+python -m pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -e ".[libero]"
 ```
 
-Install LIBERO separately. DINOv3 and GroundingDINO weights are not included.
+Install [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) separately, then rerun `python -m pip install -e ".[libero]"` and `python -m pip check` to check the pinned dependencies. Keep the LIBERO source, scene assets, BDDL files, and initial states fixed across comparisons. DINOv3, BERT, and GroundingDINO assets must also be prepared separately; use the same local copies across runs.
+
+OSMesa is a native library and is not installed or pinned by `pip`. Install a build matching **Mesa 21.2.6 / llvmpipe LLVM 12.0.0**. If it is outside the system library search path, set the following before starting Python, replacing the placeholder with the actual library path:
+
+```bash
+export OSMESA_LIBRARY=/absolute/path/to/libOSMesa.so.8
+export LD_LIBRARY_PATH="$(dirname "$OSMESA_LIBRARY")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+Set both `MUJOCO_GL=osmesa` and `PYOPENGL_PLATFORM=osmesa` explicitly in the evaluation shell, as in the example below. Existing environment variables take precedence over the evaluator defaults. Selecting `osmesa` alone does not fix the Mesa/LLVM version.
 
 ## Data
 
@@ -58,6 +86,10 @@ torchrun --nproc_per_node=4 experiments/libero/train.py \
 One invocation evaluates one checkpoint on one suite. Checkpoint selection and multi-GPU scheduling are intentionally outside the evaluator.
 
 ```bash
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
+export USE_TORCH=1 USE_TF=0 USE_FLAX=0
+export PYTHONNOUSERSITE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python experiments/libero/evaluate.py \
   --ckpt_path pretrained/TurboVLA/checkpoints/libero/turbovla_libero.pth \
   --dinov3_path /path/to/dinov3-vitb \
@@ -66,6 +98,7 @@ python experiments/libero/evaluate.py \
   --stats_key libero_all4_no_noops \
   --task_suite_name libero_object \
   --num_trials_per_task 50 \
+  --num_steps_wait 10 --env_img_res 256 \
   --chunk_size 12 \
   --num_open_loop_steps 12 \
   --seed 7 \
