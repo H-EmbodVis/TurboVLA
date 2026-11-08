@@ -364,7 +364,14 @@ class TurboVLAPolicy:
         self.ckpt_path = str(ckpt_path)
         self.dinov3_path = str(dinov3_path)
         self.bert_path = str(bert_path)
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        if device:
+            self.device = torch.device(device)
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.xpu.is_available():
+            self.device = torch.device("xpu")
+        else:
+            self.device = torch.device("cpu")
         self.chunk_size = int(chunk_size)
         self.action_dim = int(action_dim)
         self.precision = str(precision).lower()
