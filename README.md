@@ -70,6 +70,9 @@ In this work, we introduce **TurboVLA**, a compact VLA architecture built on a d
 
 ---
 
+For inferencing on XPU (Intel GPU), please refer to
+[Getting Started on XPU](./XPU.md).
+
 ## ⚙️ Installation
 
 Clone the repository:
