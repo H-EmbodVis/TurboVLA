@@ -106,8 +106,10 @@ class DINOv3VisionEncoder(nn.Module):
         grad_context = torch.no_grad() if self.config.frozen else nullcontext()
         with grad_context:
             with autocast_context:
-                outputs = self.backbone(pixel_values=pixel_values, output_hidden_states=True)
-        tokens = outputs.hidden_states[-1] if outputs.hidden_states is not None else outputs.last_hidden_state
+                outputs = self.backbone(pixel_values=pixel_values)
+        # last_hidden_state is the final-LayerNorm output on every transformers version. hidden_states[-1] equals
+        # it on 4.x but is the pre-norm block output on 5.x, which would silently change the features.
+        tokens = outputs.last_hidden_state
         if tokens.shape[1] == expected_patches + self.prefix_tokens:
             return tokens[:, self.prefix_tokens :, :]
         if tokens.shape[1] == expected_patches:
