@@ -27,6 +27,7 @@ This repository contains the official implementation of **TurboVLA** for the pap
 
 ## 📣 News
 
+- `2026.11.16`: Released the [LIBERO inference latency benchmark code](scripts/libero/benchmark_latency.py).
 - `2026.09.27`:🚀TurboVLA achieves an **88.06%** average success rate on **RoboTwin 2.0**. The paper, code, and checkpoints have been updated.
 - `2026.07.31`: Released the TurboVLA model checkpoints on [Hugging Face](https://huggingface.co/H-EmbodVis/TurboVLA).
 - `2026.07.30`: Released the paper, training and evaluation code.
